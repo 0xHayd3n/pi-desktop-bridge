@@ -137,6 +137,16 @@ def _capture_width(value: str) -> int:
     return width
 
 
+def _idle_timeout(value: str) -> int:
+    try:
+        seconds = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("idle timeout must be an integer from 0 to 3600 seconds") from exc
+    if not 0 <= seconds <= 3600:
+        raise argparse.ArgumentTypeError("idle timeout must be an integer from 0 to 3600 seconds")
+    return seconds
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Raspberry Pi desktop bridge over SSH")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -151,6 +161,8 @@ def _parser() -> argparse.ArgumentParser:
         if name == "serve":
             sub.add_argument("--capture-max-width", type=_capture_width,
                              help="Maximum width of post-action images; explicit screenshots stay independent")
+            sub.add_argument("--idle-timeout", type=_idle_timeout, default=300,
+                             help="Release idle desktop sessions after this many seconds (default: 300; 0 disables)")
     return parser
 
 
@@ -168,7 +180,8 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "serve":
             with SSHTransport(args.host) as transport:
                 create_server(args.host, transport=transport,
-                              capture_max_width=args.capture_max_width).run(transport="stdio")
+                              capture_max_width=args.capture_max_width,
+                              idle_timeout=args.idle_timeout).run(transport="stdio")
         else:
             with SSHTransport(args.host) as transport:
                 if args.command == "status":

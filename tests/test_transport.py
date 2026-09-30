@@ -15,13 +15,14 @@ from unittest.mock import patch
 
 from pi_desktop_bridge import cli
 from pi_desktop_bridge.transport import (
-    REQUIRED_CAPABILITIES, RemoteAgentError, SSHTransport, TransportError,
+    AGENT_BOOTSTRAP, EXPECTED_AGENT_SHA256, REQUIRED_CAPABILITIES, RemoteAgentError, SSHTransport, TransportError,
     validate_host,
 )
 
 
-HELLO = {"protocol_version": 4, "agent_version": "0.4.0", "agent_sha256": "a" * 64,
+HELLO = {"protocol_version": 4, "agent_version": "0.5.0", "agent_sha256": EXPECTED_AGENT_SHA256,
          "capabilities": sorted(REQUIRED_CAPABILITIES)}
+MISMATCH_SHA256 = "0" * 64 if EXPECTED_AGENT_SHA256 != "0" * 64 else "1" * 64
 
 
 def child_argv(source: str) -> list[str]:
@@ -118,6 +119,109 @@ for line in sys.stdin:
                         transport.request("click", {"x": 1, "y": 1})
                     self.assertEqual(caught.exception.input_state, "not_started")
             self.assertEqual(record.read_text(), "hello")
+
+    def test_source_mismatch_preserves_diagnostics_and_blocks_all_desktop_methods(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            record = Path(directory) / "methods.txt"
+            stale_hello = {**HELLO, "agent_sha256": MISMATCH_SHA256}
+            child = f"""
+import json, pathlib, sys
+for line in sys.stdin:
+    request = json.loads(line)
+    with pathlib.Path({str(record)!r}).open('a') as stream:
+        stream.write(request['method'] + '\\n')
+    result = {stale_hello!r} if request['method'] == 'hello' else {{'ready': True}}
+    print(json.dumps({{'id': request['id'], 'result': result}}), flush=True)
+    if request['method'] == 'disconnect':
+        break
+"""
+            with patch("pi_desktop_bridge.transport.ssh_argv", return_value=child_argv(child)):
+                with SSHTransport("pi-desktop", timeout=2) as transport:
+                    self.assertEqual(transport.request("hello"), stale_hello)
+                    process = transport._process
+                    self.assertEqual(transport.request("health"), {"ready": True})
+                    for method in (
+                        "status", "screenshot", "wait_for_stable", "move", "click",
+                        "drag", "scroll", "type_text", "key",
+                    ):
+                        with self.subTest(method=method), self.assertRaises(TransportError) as caught:
+                            transport.request(method)
+                        self.assertEqual(caught.exception.code, "agent_source_mismatch")
+                        self.assertEqual(caught.exception.input_state, "not_started")
+                        self.assertIn("Deploy the latest agent", str(caught.exception))
+                        self.assertIn("restart", str(caught.exception))
+                    self.assertIs(transport._process, process)
+                    self.assertEqual(transport.disconnect(), {"ready": True})
+            self.assertEqual(record.read_text().splitlines(), ["hello", "health", "disconnect"])
+
+    def test_malformed_hello_source_or_version_rejects_before_desktop_request(self) -> None:
+        invalid_hellos = {
+            "missing_hash": {key: value for key, value in HELLO.items() if key != "agent_sha256"},
+            "uppercase_hash": {**HELLO, "agent_sha256": "A" * 64},
+            "short_hash": {**HELLO, "agent_sha256": "a" * 63},
+            "nonhex_hash": {**HELLO, "agent_sha256": "g" * 64},
+            "nonstring_hash": {**HELLO, "agent_sha256": 123},
+            "missing_version": {key: value for key, value in HELLO.items() if key != "agent_version"},
+            "empty_version": {**HELLO, "agent_version": ""},
+            "blank_version": {**HELLO, "agent_version": " "},
+            "long_version": {**HELLO, "agent_version": "x" * 65},
+        }
+        for name, invalid_hello in invalid_hellos.items():
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                record = Path(directory) / "methods.txt"
+                child = f"""
+import json, pathlib, sys
+for line in sys.stdin:
+    request = json.loads(line)
+    with pathlib.Path({str(record)!r}).open('a') as stream:
+        stream.write(request['method'] + '\\n')
+    print(json.dumps({{'id': request['id'], 'result': {invalid_hello!r}}}), flush=True)
+"""
+                with patch("pi_desktop_bridge.transport.ssh_argv", return_value=child_argv(child)):
+                    with SSHTransport("pi-desktop", timeout=2) as transport:
+                        with self.assertRaises(TransportError) as caught:
+                            transport.request("click", {"x": 1, "y": 1})
+                        self.assertEqual(caught.exception.code, "incompatible_agent")
+                        self.assertEqual(caught.exception.input_state, "not_started")
+                        self.assertIsNone(transport._process)
+                self.assertEqual(record.read_text().splitlines(), ["hello"])
+
+    def test_each_new_ssh_session_rechecks_source_and_matching_actions_work(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            launch_count = Path(directory) / "launch_count.txt"
+            record = Path(directory) / "methods.txt"
+            child = f"""
+import json, pathlib, sys
+counter = pathlib.Path({str(launch_count)!r})
+launch = int(counter.read_text()) + 1 if counter.exists() else 1
+counter.write_text(str(launch))
+hello = {HELLO!r}
+if launch == 2:
+    hello['agent_sha256'] = {MISMATCH_SHA256!r}
+for line in sys.stdin:
+    request = json.loads(line)
+    with pathlib.Path({str(record)!r}).open('a') as stream:
+        stream.write(str(launch) + ':' + request['method'] + '\\n')
+    result = hello if request['method'] == 'hello' else {{'ok': True}}
+    print(json.dumps({{'id': request['id'], 'result': result}}), flush=True)
+    if request['method'] == 'disconnect':
+        break
+"""
+            with patch("pi_desktop_bridge.transport.ssh_argv", return_value=child_argv(child)):
+                with SSHTransport("pi-desktop", timeout=2) as transport:
+                    self.assertEqual(transport.request("click", {"x": 1, "y": 1}), {"ok": True})
+                    transport.disconnect()
+                    with self.assertRaises(TransportError) as caught:
+                        transport.request("status")
+                    self.assertEqual((caught.exception.code, caught.exception.input_state),
+                                     ("agent_source_mismatch", "not_started"))
+                    self.assertEqual(transport.request("health"), {"ok": True})
+                    transport.disconnect()
+                    self.assertEqual(transport.request("click", {"x": 2, "y": 2}), {"ok": True})
+            self.assertEqual(record.read_text().splitlines(), [
+                "1:hello", "1:click", "1:disconnect", "2:hello", "2:health",
+                "2:disconnect", "3:hello", "3:click",
+            ])
 
     def test_structured_remote_rejection_keeps_healthy_connection(self) -> None:
         child = f"""
@@ -301,6 +405,73 @@ for line in sys.stdin:
                 with patch.object(transport, "_write_request", side_effect=slow_write):
                     with self.assertRaisesRegex(TransportError, "timed out"):
                         transport.request("status")
+
+
+class SnapshotStartupTests(unittest.TestCase):
+    def test_atomic_replacement_during_startup_reports_executed_bytes_and_blocks_input(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            target = home / ".local/share/pi-desktop-bridge/pi_agent.py"
+            target.parent.mkdir(parents=True)
+            replacement = b"AGENT_VERSION = '0.5.0'\n# newer source with the same version\n"
+            replacement_digest = hashlib.sha256(replacement).hexdigest()
+            source = f'''
+import hashlib,json,os,pathlib,sys
+AGENT_VERSION='0.5.0'
+path=pathlib.Path(__file__)
+temporary=path.with_suffix('.new')
+temporary.write_bytes({replacement!r})
+os.replace(temporary,path)
+# Reproduce the old self-report race: module imports see the replacement file.
+AGENT_SHA256=hashlib.sha256(path.read_bytes()).hexdigest()
+if __name__ == '__main__':
+    raise AssertionError('Agent ran before its snapshot hash was bound')
+def main():
+    for line in sys.stdin:
+        request=json.loads(line)
+        with (path.parent/'methods.txt').open('a') as record:
+            record.write(request['method']+'\\n')
+        if request['method']=='hello':
+            result={{**{HELLO!r},'agent_sha256':AGENT_SHA256,'agent_version':AGENT_VERSION}}
+        elif request['method']=='health':
+            result={{'agent_sha256':AGENT_SHA256}}
+        else:
+            result={{'ok':True}}
+        print(json.dumps({{'id':request['id'],'result':result}}),flush=True)
+        if request['method']=='disconnect': break
+'''.encode()
+            target.write_bytes(source)
+            environment = {**os.environ, "USERPROFILE": str(home), "HOME": str(home)}
+            with patch("pi_desktop_bridge.transport.ssh_argv", return_value=child_argv(AGENT_BOOTSTRAP)), \
+                    patch("pi_desktop_bridge.transport._ssh_environment", return_value=environment), \
+                    patch("pi_desktop_bridge.transport.EXPECTED_AGENT_SHA256", replacement_digest):
+                with SSHTransport("pi-desktop", timeout=3) as connection:
+                    hello = connection.request("hello")
+                    self.assertEqual(hello["agent_version"], "0.5.0")
+                    self.assertEqual(hello["agent_sha256"], hashlib.sha256(source).hexdigest())
+                    self.assertEqual(target.read_bytes(), replacement)
+                    for method in ("status", "screenshot", "click"):
+                        with self.subTest(method=method), self.assertRaises(TransportError) as caught:
+                            connection.request(method, {"x": 1, "y": 1} if method == "click" else {})
+                        self.assertEqual((caught.exception.code, caught.exception.input_state),
+                                         ("agent_source_mismatch", "not_started"))
+                    self.assertEqual(connection.request("health")["agent_sha256"], hello["agent_sha256"])
+                    self.assertEqual(connection.disconnect(), {"ok": True})
+            self.assertEqual((target.parent / "methods.txt").read_text().splitlines(),
+                             ["hello", "health", "disconnect"])
+
+    def test_snapshot_size_limit_rejects_before_execution(self):
+        for source in (b"", b"x" * 1_048_577):
+            with self.subTest(size=len(source)), tempfile.TemporaryDirectory() as directory:
+                home = Path(directory)
+                target = home / ".local/share/pi-desktop-bridge/pi_agent.py"
+                target.parent.mkdir(parents=True)
+                target.write_bytes(source)
+                result = subprocess.run(child_argv(AGENT_BOOTSTRAP), capture_output=True,
+                                        timeout=3, env={**os.environ, "USERPROFILE": str(home), "HOME": str(home)})
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(result.stdout, b"")
+                self.assertIn(b"source is empty or exceeds", result.stderr)
 
 
 class DeployTests(unittest.TestCase):

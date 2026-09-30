@@ -511,7 +511,7 @@ class ProtocolV4Tests(unittest.TestCase):
              mock.patch.object(agent.subprocess, "Popen") as spawn:
             result = self.desktop.dispatch("hello", {})
         self.assertEqual(result["protocol_version"], 4)
-        self.assertEqual(result["agent_version"], "0.4.0")
+        self.assertEqual(result["agent_version"], "0.5.0")
         self.assertRegex(result["agent_sha256"], r"^[0-9a-f]{64}$")
         self.assertEqual(set(result["capabilities"]), {"hello", "health", "status", "screenshot", "wait_for_stable", "move", "click", "drag", "scroll", "type_text", "key", "disconnect"})
         ensure.assert_not_called()

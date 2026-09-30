@@ -2,7 +2,7 @@
 
 import asyncio
 import base64
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, nullcontext
 from datetime import timedelta
 import json
 from pathlib import Path
@@ -117,6 +117,7 @@ class StdioFixtureTransport(FakeTransport):
         self.scenario = scenario
         self.directory = Path(directory)
         self.timeout = 0.3 if scenario == "budget" else 3.0
+        self.session_active = False
 
     def request(self, method: str, params: dict | None = None, *, deadline: float | None = None) -> dict:
         with (self.directory / "calls.jsonl").open("a") as stream:
@@ -126,22 +127,33 @@ class StdioFixtureTransport(FakeTransport):
             if deadline is not None and time.monotonic() >= deadline:
                 raise TransportError("shared deadline expired", input_state="not_started")
         blocked_method = "screenshot" if self.scenario == "cancel_capture" else "click"
-        if self.scenario != "budget" and method == blocked_method and not (self.directory / "release").exists():
+        if self.scenario in {"cancel_queue", "cancel_active", "cancel_capture", "idle_active"} and method == blocked_method and not (self.directory / "release").exists():
             (self.directory / "started").touch()
             end = time.monotonic() + 3
             while not (self.directory / "release").exists() and time.monotonic() < end:
                 time.sleep(0.005)
         if self.scenario == "cancel_capture" and method == "click":
             raise TransportError("input outcome unknown")
+        if method == "health":
+            return {"desktop_ready": True, "session_active": self.session_active, "checks": []}
+        self.session_active = True
         return super().request(method, params, deadline=deadline)
+
+    def disconnect(self, *, deadline: float | None = None) -> dict:
+        with (self.directory / "calls.jsonl").open("a") as stream:
+            stream.write(json.dumps({"method": "disconnect", "time": time.monotonic(),
+                                     "deadline": deadline}) + "\n")
+        self.session_active = False
+        (self.directory / "disconnected").touch()
+        return super().disconnect(deadline=deadline)
 
 
 @asynccontextmanager
-async def stdio_fixture(scenario: str):
-    with tempfile.TemporaryDirectory() as directory:
+async def stdio_fixture(scenario: str, idle_timeout: int = 300, directory: Path | None = None):
+    with (tempfile.TemporaryDirectory() if directory is None else nullcontext(str(directory))) as directory:
         parameters = StdioServerParameters(
             command=sys.executable,
-            args=[str(Path(__file__).resolve()), "--stdio-fixture", scenario, directory],
+            args=[str(Path(__file__).resolve()), "--stdio-fixture", scenario, directory, str(idle_timeout)],
         )
         async with stdio_client(parameters) as (read, write):
             async with ClientSession(read, write, read_timeout_seconds=timedelta(seconds=5)) as session:
@@ -885,6 +897,38 @@ class ServerTests(unittest.TestCase):
 
 
 class StdioConcurrencyTests(unittest.IsolatedAsyncioTestCase):
+    async def test_idle_release_without_requests_invalidates_view_and_reconnects(self) -> None:
+        async with stdio_fixture("idle", idle_timeout=1) as (session, directory):
+            screenshot = await session.call_tool("desktop_screenshot", {})
+            view_id = json.loads(screenshot.content[0].text)["view_id"]
+            await wait_for_file(directory / "disconnected")
+            calls_before = (directory / "calls.jsonl").read_text()
+            stale = await session.call_tool("desktop_move", {"x": 0, "y": 0, "view_id": view_id})
+            self.assertTrue(stale.isError)
+            self.assertIn("stale_view", stale.content[0].text)
+            self.assertEqual((directory / "calls.jsonl").read_text(), calls_before)
+            health = json.loads((await session.call_tool("desktop_health", {})).content[0].text)
+            self.assertEqual(health["session_policy"], {
+                "idle_timeout_seconds": 1, "local_session_active": False,
+                "idle_remaining_seconds": None, "auto_release_count": 1,
+            })
+            self.assertFalse((await session.call_tool("desktop_screenshot", {})).isError)
+            status = json.loads((await session.call_tool("desktop_status", {})).content[0].text)
+            self.assertTrue(status["session_policy"]["local_session_active"])
+            self.assertGreater(status["session_policy"]["idle_remaining_seconds"], 0.5)
+
+    async def test_health_polling_does_not_extend_desktop_lease(self) -> None:
+        async with stdio_fixture("idle", idle_timeout=1) as (session, directory):
+            await session.call_tool("desktop_status", {})
+            end = time.monotonic() + 3
+            while not (directory / "disconnected").exists() and time.monotonic() < end:
+                await session.call_tool("desktop_health", {})
+                await asyncio.sleep(0.1)
+            self.assertTrue((directory / "disconnected").exists(), "Health polling kept the lease alive")
+            calls = [json.loads(line) for line in (directory / "calls.jsonl").read_text().splitlines()]
+            released = next(call for call in calls if call["method"] == "disconnect")
+            self.assertLess(released["time"] - calls[0]["time"], 2.5)
+
     async def test_concurrent_stdio_tools_include_queue_time_in_deadline(self) -> None:
         async with stdio_fixture("budget") as (session, directory):
             first, second = await asyncio.gather(
@@ -918,7 +962,7 @@ class StdioConcurrencyTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(methods, ["click", "screenshot", "health"])
 
     async def test_cancelled_active_input_holds_lock_and_requires_new_observation(self) -> None:
-        async with stdio_fixture("cancel_active") as (session, directory):
+        async with stdio_fixture("cancel_active", idle_timeout=1) as (session, directory):
             active_id = session._request_id
             active = asyncio.create_task(session.call_tool("desktop_click", {"x": 1, "y": 1}))
             await wait_for_file(directory / "started")
@@ -927,18 +971,45 @@ class StdioConcurrencyTests(unittest.IsolatedAsyncioTestCase):
                 with self.assertRaisesRegex(McpError, "Request cancelled"):
                     await asyncio.wait_for(asyncio.shield(active), timeout=0.5)
                 next_action = asyncio.create_task(session.call_tool("desktop_move", {"x": 2, "y": 2}))
-                await asyncio.sleep(0.05)
+                await asyncio.sleep(1.1)
                 self.assertFalse(next_action.done(), "Cancellation released the active worker's lock")
+                self.assertFalse((directory / "disconnected").exists())
             finally:
                 (directory / "release").touch()
                 await asyncio.gather(active, return_exceptions=True)
             rejected = await next_action
             self.assertTrue(rejected.isError)
             self.assertIn("previous input outcome is uncertain", rejected.content[0].text)
+            await wait_for_file(directory / "disconnected")
+            still_guarded = await session.call_tool("desktop_move", {"x": 2, "y": 2})
+            self.assertTrue(still_guarded.isError)
+            self.assertIn("previous input outcome is uncertain", still_guarded.content[0].text)
             self.assertFalse((await session.call_tool("desktop_screenshot", {})).isError)
             self.assertFalse((await session.call_tool("desktop_move", {"x": 2, "y": 2})).isError)
             methods = [json.loads(line)["method"] for line in (directory / "calls.jsonl").read_text().splitlines()]
-            self.assertEqual(methods, ["click", "screenshot", "screenshot", "move", "screenshot"])
+            self.assertEqual(methods, ["click", "screenshot", "disconnect", "screenshot", "move", "screenshot"])
+
+    async def test_stdio_shutdown_awaits_active_worker_and_releases_without_orphan(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            async with stdio_fixture("idle_active", idle_timeout=1, directory=directory) as (session, _):
+                request_id = session._request_id
+                active = asyncio.create_task(session.call_tool("desktop_click", {"x": 0, "y": 0}))
+                await wait_for_file(directory / "started")
+                await cancel_request(session, request_id)
+                with self.assertRaisesRegex(McpError, "Request cancelled"):
+                    await active
+
+                async def finish_active_worker():
+                    await asyncio.sleep(0.15)
+                    self.assertFalse((directory / "disconnected").exists())
+                    (directory / "release").touch()
+
+                release = asyncio.create_task(finish_active_worker())
+            await release
+            self.assertTrue((directory / "server_stopped").exists(), "SDK had to kill the server")
+            methods = [json.loads(line)["method"] for line in (directory / "calls.jsonl").read_text().splitlines()]
+            self.assertEqual(methods, ["click", "screenshot", "disconnect"])
 
     async def test_cancelled_capture_does_not_clear_existing_observation_guard(self) -> None:
         async with stdio_fixture("cancel_capture") as (session, directory):
@@ -960,8 +1031,285 @@ class StdioConcurrencyTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse((await session.call_tool("desktop_move", {"x": 2, "y": 2})).isError)
 
 
+class IdleLifecycleTests(unittest.IsolatedAsyncioTestCase):
+    async def wait_until(self, condition) -> None:
+        async with asyncio.timeout(4):
+            while not condition():
+                await asyncio.sleep(0.01)
+
+    async def policy(self, server) -> dict:
+        content, _ = await server.call_tool("desktop_health", {})
+        return json.loads(content[0].text)["session_policy"]
+
+    def test_configuration_is_strict_and_bounded(self) -> None:
+        for invalid in (-1, 3601, True, False, 1.5, "1", None):
+            with self.subTest(value=invalid), self.assertRaisesRegex(ValueError, "idle_timeout"):
+                create_server("pi-desktop", transport=FakeTransport(), idle_timeout=invalid)
+
+    async def test_remote_inactive_health_invalidates_view_without_transport_input(self) -> None:
+        fake = FakeTransport()
+        server = create_server("pi-desktop", transport=fake)
+        await server.call_tool("desktop_screenshot", {})
+        await self.policy(server)
+        before = list(fake.calls)
+        with self.assertRaisesRegex(Exception, "stale_view"):
+            await server.call_tool("desktop_move", {"x": 0, "y": 0, "view_id": FRAME_ID})
+        self.assertEqual(fake.calls, before)
+
+    async def test_remote_policy_collision_rejected(self) -> None:
+        class Collision(FakeTransport):
+            def request(self, *args, **kwargs):
+                return {"session_policy": {"local_session_active": True}}
+
+        for tool in ("desktop_health", "desktop_status"):
+            with self.subTest(tool=tool), self.assertRaisesRegex(Exception, "conflicting status metadata"):
+                await create_server("pi-desktop", transport=Collision()).call_tool(tool, {})
+
+    async def test_source_mismatch_is_not_activity_and_does_not_set_guard(self) -> None:
+        class Mismatch(FakeTransport):
+            def request(self, method, params=None, *, deadline=None):
+                if method != "health":
+                    raise TransportError("source mismatch", code="agent_source_mismatch", input_state="not_started")
+                return super().request(method, params, deadline=deadline)
+
+        fake = Mismatch()
+        server = create_server("pi-desktop", transport=fake, idle_timeout=1)
+        async with server.settings.lifespan(server):
+            for tool, args in (("desktop_status", {}), ("desktop_screenshot", {}),
+                               ("desktop_move", {"x": 0, "y": 0})):
+                with self.assertRaisesRegex(Exception, "source mismatch"):
+                    await server.call_tool(tool, args)
+            await asyncio.sleep(1.1)
+            content, _ = await server.call_tool("desktop_health", {})
+            state = json.loads(content[0].text)
+            self.assertFalse(state["observation_required"])
+            self.assertFalse(state["session_policy"]["local_session_active"])
+            self.assertIsNone(state["session_policy"]["idle_remaining_seconds"])
+            self.assertNotIn(("disconnect", {}), fake.calls)
+
+    async def test_invalid_and_stale_requests_do_not_renew_activity(self) -> None:
+        class Invalid(FakeTransport):
+            def request(self, method, params=None, *, deadline=None):
+                if method == "click":
+                    raise RemoteAgentError("invalid_params", "invalid click", "not_started")
+                if method == "health":
+                    return {"session_active": True}
+                return super().request(method, params, deadline=deadline)
+
+        fake = Invalid()
+        server = create_server("pi-desktop", transport=fake, idle_timeout=1)
+        await server.call_tool("desktop_screenshot", {})
+        self.assertFalse(any(task.get_name() == "pi-desktop-idle-release" for task in asyncio.all_tasks()),
+                         "Timer started before the SDK lifespan")
+        before = (await self.policy(server))["idle_remaining_seconds"]
+        await asyncio.sleep(0.05)
+        for tool, args in (("desktop_screenshot", {"max_width": 0}),
+                           ("desktop_move", {"x": 0, "y": 0, "view_id": "bad"}),
+                           ("desktop_click", {"x": 0, "y": 0})):
+            with self.assertRaises(Exception):
+                await server.call_tool(tool, args)
+        after = (await self.policy(server))["idle_remaining_seconds"]
+        self.assertLess(after, before - 0.03)
+
+    async def test_failed_observation_with_no_input_still_expires(self) -> None:
+        class CaptureFails(FakeTransport):
+            def request(self, method, params=None, *, deadline=None):
+                if method == "screenshot":
+                    raise RemoteAgentError("capture_failed", "capture unavailable", "not_started")
+                return super().request(method, params, deadline=deadline)
+
+        fake = CaptureFails()
+        server = create_server("pi-desktop", transport=fake, idle_timeout=1)
+        async with server.settings.lifespan(server):
+            with self.assertRaisesRegex(Exception, "capture unavailable"):
+                await server.call_tool("desktop_screenshot", {})
+            await self.wait_until(lambda: ("disconnect", {}) in fake.calls)
+
+    async def test_may_have_executed_outcome_expires_even_with_rejection_code(self) -> None:
+        class Uncertain(FakeTransport):
+            def request(self, method, params=None, *, deadline=None):
+                raise RemoteAgentError("invalid_params", "outcome uncertain", "may_have_executed")
+
+        fake = Uncertain()
+        server = create_server("pi-desktop", transport=fake, idle_timeout=1)
+        async with server.settings.lifespan(server):
+            with self.assertRaisesRegex(Exception, "Input may have executed"):
+                await server.call_tool("desktop_move", {"x": 0, "y": 0})
+            await asyncio.sleep(1.15)
+            self.assertIn(("disconnect", {}), fake.calls)
+
+    async def test_disabled_timer_has_no_idle_task_but_shutdown_releases(self) -> None:
+        fake = FakeTransport()
+        server = create_server("pi-desktop", transport=fake, idle_timeout=0)
+        async with server.settings.lifespan(server):
+            await server.call_tool("desktop_screenshot", {})
+            await asyncio.sleep(1.1)
+            self.assertNotIn(("disconnect", {}), fake.calls)
+            self.assertFalse(any(task.get_name() == "pi-desktop-idle-release" for task in asyncio.all_tasks()))
+            policy = await self.policy(server)
+            self.assertEqual(policy["idle_timeout_seconds"], 0)
+            self.assertIsNone(policy["idle_remaining_seconds"])
+        self.assertEqual(fake.calls[-1], ("disconnect", {}))
+
+    async def test_cancelled_queued_input_does_not_renew_or_run_after_health_worker(self) -> None:
+        class BlockedHealth(FakeTransport):
+            def __init__(self):
+                super().__init__()
+                self.started, self.release = threading.Event(), threading.Event()
+
+            def request(self, method, params=None, *, deadline=None):
+                if method == "health":
+                    self.started.set()
+                    self.release.wait(4)
+                    self.calls.append((method, {}))
+                    return {"session_active": True}
+                return super().request(method, params, deadline=deadline)
+
+        fake = BlockedHealth()
+        server = create_server("pi-desktop", transport=fake, idle_timeout=1)
+        async with server.settings.lifespan(server):
+            await server.call_tool("desktop_screenshot", {})
+            active = asyncio.create_task(server.call_tool("desktop_health", {}))
+            await self.wait_until(fake.started.is_set)
+            queued = asyncio.create_task(server.call_tool("desktop_move", {"x": 0, "y": 0}))
+            await asyncio.sleep(0.03)
+            queued.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await queued
+            try:
+                await asyncio.sleep(1.1)
+                self.assertNotIn(("disconnect", {}), fake.calls)
+            finally:
+                fake.release.set()
+            await active
+            async with asyncio.timeout(0.5):
+                await self.wait_until(lambda: ("disconnect", {}) in fake.calls)
+            self.assertEqual([method for method, _ in fake.calls], ["screenshot", "health", "disconnect"])
+
+    async def test_timer_rechecks_new_activity_after_waiting_for_active_worker(self) -> None:
+        class Blocked(FakeTransport):
+            def __init__(self):
+                super().__init__()
+                self.started, self.release = threading.Event(), threading.Event()
+
+            def request(self, method, params=None, *, deadline=None):
+                if method == "click":
+                    self.started.set()
+                    self.release.wait(4)
+                return super().request(method, params, deadline=deadline)
+
+        fake = Blocked()
+        server = create_server("pi-desktop", transport=fake, idle_timeout=1)
+        async with server.settings.lifespan(server):
+            await server.call_tool("desktop_screenshot", {})
+            active = asyncio.create_task(server.call_tool("desktop_click", {"x": 0, "y": 0}))
+            await self.wait_until(fake.started.is_set)
+            try:
+                await asyncio.sleep(1.15)
+                self.assertNotIn(("disconnect", {}), fake.calls)
+            finally:
+                fake.release.set()
+            await active
+            await asyncio.sleep(0.15)
+            self.assertNotIn(("disconnect", {}), fake.calls)
+            await self.wait_until(lambda: ("disconnect", {}) in fake.calls)
+            self.assertEqual([method for method, _ in fake.calls], ["screenshot", "click", "screenshot", "disconnect"])
+
+    async def test_uncertain_input_and_failed_capture_expire_without_clearing_guard(self) -> None:
+        class Failure(FakeTransport):
+            def __init__(self, capture):
+                super().__init__()
+                self.capture = capture
+                self.failed = False
+
+            def request(self, method, params=None, *, deadline=None):
+                if not self.failed and method == ("screenshot" if self.capture else "click"):
+                    self.failed = True
+                    self.calls.append((method, params or {}))
+                    raise TransportError("capture unavailable" if self.capture else "input uncertain")
+                return super().request(method, params, deadline=deadline)
+
+        for capture in (False, True):
+            with self.subTest(capture=capture):
+                fake = Failure(capture)
+                server = create_server("pi-desktop", transport=fake, idle_timeout=1)
+                async with server.settings.lifespan(server):
+                    with self.assertRaises(Exception):
+                        await server.call_tool("desktop_click", {"x": 0, "y": 0})
+                    await self.wait_until(lambda: ("disconnect", {}) in fake.calls)
+                    with self.assertRaisesRegex(Exception, "previous input outcome is uncertain"):
+                        await server.call_tool("desktop_move", {"x": 0, "y": 0})
+                    await server.call_tool("desktop_screenshot", {})
+                    await server.call_tool("desktop_move", {"x": 0, "y": 0})
+
+    async def test_failed_release_attempt_is_quiet_once_per_activity_interval(self) -> None:
+        class BrokenRelease(FakeTransport):
+            def request(self, method, params=None, *, deadline=None):
+                if method == "health":
+                    return {"session_active": True}
+                return super().request(method, params, deadline=deadline)
+
+            def disconnect(self, *, deadline=None):
+                super().disconnect(deadline=deadline)
+                raise TransportError("release unavailable")
+
+        fake = BrokenRelease()
+        server = create_server("pi-desktop", transport=fake, idle_timeout=1)
+        async with server.settings.lifespan(server):
+            await server.call_tool("desktop_screenshot", {})
+            await self.wait_until(lambda: ("disconnect", {}) in fake.calls)
+            await asyncio.sleep(1.1)
+            self.assertEqual(fake.calls.count(("disconnect", {})), 1)
+            policy = await self.policy(server)
+            self.assertEqual(policy["auto_release_count"], 0)
+            self.assertIsNone(policy["idle_remaining_seconds"])
+            self.assertTrue(policy["local_session_active"])
+            with self.assertRaisesRegex(Exception, "stale_view"):
+                await server.call_tool("desktop_move", {"x": 0, "y": 0, "view_id": FRAME_ID})
+            await server.call_tool("desktop_screenshot", {})
+            await self.wait_until(lambda: fake.calls.count(("disconnect", {})) == 2)
+
+    async def test_shutdown_waits_for_timer_disconnect_and_repeated_cancellation(self) -> None:
+        class SlowRelease(FakeTransport):
+            def __init__(self):
+                super().__init__()
+                self.started, self.release, self.finished = (threading.Event() for _ in range(3))
+                self.concurrent = False
+
+            def disconnect(self, *, deadline=None):
+                if self.started.is_set() and not self.finished.is_set():
+                    self.concurrent = True
+                self.started.set()
+                self.release.wait(4)
+                self.finished.set()
+                return super().disconnect(deadline=deadline)
+
+        fake = SlowRelease()
+        server = create_server("pi-desktop", transport=fake, idle_timeout=1)
+        context = server.settings.lifespan(server)
+        await context.__aenter__()
+        await server.call_tool("desktop_screenshot", {})
+        await self.wait_until(fake.started.is_set)
+        shutdown = asyncio.create_task(context.__aexit__(None, None, None))
+        await asyncio.sleep(0.03)
+        shutdown.cancel()
+        await asyncio.sleep(0.03)
+        shutdown.cancel()
+        try:
+            await asyncio.sleep(0.03)
+            self.assertFalse(shutdown.done(), "Shutdown abandoned its owned cleanup worker")
+        finally:
+            fake.release.set()
+        await shutdown
+        self.assertTrue(fake.finished.is_set())
+        self.assertFalse(fake.concurrent)
+        self.assertFalse(any(task.get_name() == "pi-desktop-idle-release" for task in asyncio.all_tasks()))
+
+
 if __name__ == "__main__":
-    if len(sys.argv) == 4 and sys.argv[1] == "--stdio-fixture":
-        create_server("pi-desktop", transport=StdioFixtureTransport(sys.argv[2], sys.argv[3])).run()
+    if len(sys.argv) == 5 and sys.argv[1] == "--stdio-fixture":
+        create_server("pi-desktop", transport=StdioFixtureTransport(sys.argv[2], sys.argv[3]),
+                      idle_timeout=int(sys.argv[4])).run()
+        (Path(sys.argv[3]) / "server_stopped").touch()
     else:
         unittest.main()

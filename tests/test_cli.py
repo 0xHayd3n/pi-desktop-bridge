@@ -91,7 +91,8 @@ class ServeTests(unittest.TestCase):
                 with mock.patch.object(cli, "SSHTransport", return_value=transport), \
                         mock.patch.object(cli, "create_server") as create:
                     self.assertEqual(cli.main(args), 0)
-                create.assert_called_once_with("pi-desktop", transport=transport, capture_max_width=width)
+                create.assert_called_once_with("pi-desktop", transport=transport, capture_max_width=width,
+                                               idle_timeout=300)
                 create.return_value.run.assert_called_once_with(transport="stdio")
                 transport.request.assert_not_called()
                 transport.__exit__.assert_called_once()
@@ -102,6 +103,22 @@ class ServeTests(unittest.TestCase):
                     contextlib.redirect_stderr(io.StringIO()):
                 with self.assertRaises(SystemExit) as raised:
                     cli.main(["serve", "--capture-max-width", value])
+                self.assertEqual(raised.exception.code, 2)
+                transport.assert_not_called()
+
+    def test_idle_policy_default_bounds_and_disabled_reach_server(self):
+        for idle_timeout in (0, 1, 300, 3600):
+            with self.subTest(idle_timeout=idle_timeout), mock.patch.object(cli, "SSHTransport") as transport, \
+                    mock.patch.object(cli, "create_server") as create:
+                self.assertEqual(cli.main(["serve", "--idle-timeout", str(idle_timeout)]), 0)
+                self.assertEqual(create.call_args.kwargs["idle_timeout"], idle_timeout)
+
+    def test_bad_idle_policy_rejected_before_connection(self):
+        for value in ("-1", "3601", "true", "1.0", "no"):
+            with self.subTest(value=value), mock.patch.object(cli, "SSHTransport") as transport, \
+                    contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as raised:
+                    cli.main(["serve", "--idle-timeout", value])
                 self.assertEqual(raised.exception.code, 2)
                 transport.assert_not_called()
 

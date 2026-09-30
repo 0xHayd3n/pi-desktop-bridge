@@ -6,6 +6,7 @@ import asyncio
 import base64
 import binascii
 from collections.abc import Callable
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 import json
 import re
@@ -277,16 +278,122 @@ def _validated_wait_frame(
 
 def create_server(
     host: str, *, transport: SSHTransport | None = None,
-    capture_max_width: int | None = None,
+    capture_max_width: int | None = None, idle_timeout: int = 300,
 ) -> FastMCP:
     """Create the server; the SSH connection opens on the first tool call."""
     default_capture = _capture_params(capture_max_width)
+    if type(idle_timeout) is not int or not 0 <= idle_timeout <= 3600:
+        raise ValueError("idle_timeout must be an integer from 0 to 3600 seconds")
     connection = transport or SSHTransport(host)
     action_lock = asyncio.Lock()
     observation_required = False
     latest_view: FrameView | None = None
+    last_activity = 0.0
+    local_session_active = False
+    release_pending = False
+    auto_release_count = 0
+    activity_changed = asyncio.Event()
+
+    def record_activity() -> None:
+        nonlocal last_activity, local_session_active, release_pending
+        last_activity = time.monotonic()
+        local_session_active = True
+        release_pending = True
+        activity_changed.set()
+
+    def possibly_held(error: BaseException, input_action: bool) -> bool:
+        if isinstance(error, TransportError):
+            if input_action:
+                return error.input_state != "not_started"
+            if error.code in {"invalid_params", "stale_view", "busy", "agent_source_mismatch"}:
+                return False
+        # A failed/invalid capture may follow lease acquisition even when no
+        # input was sent. It must age out just like an uncertain input result.
+        return True
+
+    async def finish_worker(worker: asyncio.Future) -> None:
+        # Neither AnyIO cancellation nor repeated native cancellation may
+        # abandon an executor worker while it owns the transport/action lock.
+        with anyio.CancelScope(shield=True):
+            while not worker.done():
+                try:
+                    await asyncio.wait({worker})
+                except asyncio.CancelledError:
+                    continue
+
+    async def release_locked(*, automatic: bool) -> None:
+        nonlocal latest_view, release_pending, local_session_active, auto_release_count
+        latest_view = None
+        release_pending = False  # One attempt per activity interval, including failures.
+        deadline = time.monotonic() + getattr(connection, "timeout", 60.0)
+        worker = asyncio.get_running_loop().run_in_executor(
+            None, lambda: connection.disconnect(deadline=deadline),
+        )
+        cancelled = False
+        try:
+            await asyncio.wait({worker})
+        except asyncio.CancelledError:
+            cancelled = True
+            await finish_worker(worker)
+        try:
+            acknowledgement = worker.result()
+            if isinstance(acknowledgement, dict) and acknowledgement.get("ok") is True:
+                local_session_active = False
+                if automatic:
+                    auto_release_count += 1
+        except Exception:
+            # Keep the conservative local state and recovery guard. The next
+            # explicit observation can reconnect; background cleanup stays quiet.
+            pass
+        if cancelled:
+            raise asyncio.CancelledError
+
+    async def idle_release() -> None:
+        while True:
+            activity_changed.clear()
+            if not release_pending:
+                await activity_changed.wait()
+                continue
+            remaining = last_activity + idle_timeout - time.monotonic()
+            if remaining > 0:
+                try:
+                    async with asyncio.timeout(remaining):
+                        await activity_changed.wait()
+                    continue
+                except TimeoutError:
+                    pass
+            async with action_lock:
+                # An active request may have renewed the interval while the
+                # timer waited. Never interrupt it or expire its fresh result.
+                if release_pending and time.monotonic() >= last_activity + idle_timeout:
+                    await release_locked(automatic=True)
+
+    async def shutdown_release() -> None:
+        async with action_lock:
+            await release_locked(automatic=False)
+
+    @asynccontextmanager
+    async def lifespan(_: FastMCP):
+        timer = (asyncio.create_task(idle_release(), name="pi-desktop-idle-release")
+                 if idle_timeout else None)
+        try:
+            yield
+        finally:
+            # The SDK joins request handlers before exiting this lifespan.
+            # Also join any timer-owned cleanup before beginning final cleanup.
+            with anyio.CancelScope(shield=True):
+                if timer is not None:
+                    timer.cancel()
+                    await finish_worker(timer)
+                    if not timer.cancelled():
+                        timer.result()
+                cleanup = asyncio.create_task(shutdown_release())
+                await finish_worker(cleanup)
+                cleanup.result()
+
     server = FastMCP(
         "Pi Desktop Bridge",
+        lifespan=lifespan,
         instructions=(
             "Control the user's authorized Raspberry Pi desktop. Mouse coordinates "
             "use original desktop pixels unless a current screenshot view_id is supplied; "
@@ -303,9 +410,10 @@ def create_server(
     async def serialized(
         operation: Callable[[float], Any], *, input_action: bool = False,
         observation: bool = False, frame_result: bool = False,
-        invalidate_view: bool = False,
+        invalidate_view: bool = False, desktop_activity: bool = False,
+        status_result: bool = False, release_session: bool = False,
     ) -> Any:
-        nonlocal observation_required, latest_view
+        nonlocal observation_required, latest_view, local_session_active, release_pending
         # Stamp the budget before queueing or offloading. FastMCP invokes sync
         # tools inline, so every tool must enter here from an async function.
         deadline = time.monotonic() + getattr(connection, "timeout", 60.0)
@@ -325,6 +433,9 @@ def create_server(
                 )
             if invalidate_view:
                 latest_view = None
+            if release_session:
+                release_pending = False
+                activity_changed.set()
             # Only the lock owner starts a worker. Cancelled waiters therefore
             # cannot leave an input queued in the executor for later delivery.
             worker = asyncio.get_running_loop().run_in_executor(None, operation, deadline)
@@ -339,23 +450,26 @@ def create_server(
                 # Keep serialization through its deadline and owned cleanup;
                 # never close a process from a different request. Shield both
                 # MCP's AnyIO cancel scope and repeated native task cancellation.
-                with anyio.CancelScope(shield=True):
-                    while not worker.done():
-                        try:
-                            await asyncio.wait({worker})
-                        except asyncio.CancelledError:
-                            continue
+                await finish_worker(worker)
                 if not worker.cancelled():
-                    worker.exception()  # Retrieve failures from cancelled calls.
+                    error = worker.exception()  # Retrieve failures from cancelled calls.
+                    if desktop_activity and (error is None or possibly_held(error, input_action)):
+                        record_activity()
                 if input_action:
                     observation_required = True
                 if input_action or frame_result:
                     latest_view = None
                 raise
-            except TransportError:
+            except TransportError as exc:
+                if desktop_activity and possibly_held(exc, input_action):
+                    record_activity()
                 if frame_result and not input_action:
                     latest_view = None
                 raise
+            if desktop_activity:
+                record_activity()
+            if release_session and isinstance(result, dict) and result.get("ok") is True:
+                local_session_active = False
             if frame_result:
                 content, latest_view = result
                 result = content
@@ -363,6 +477,23 @@ def create_server(
                 # A cancelled screenshot is not an observation delivered to the
                 # caller, even when the background capture itself succeeded.
                 observation_required = False
+            if status_result:
+                if result.get("session_active") is False:
+                    latest_view = None
+                    local_session_active = False
+                result = json.dumps({
+                    **result, "observation_required": observation_required,
+                    "recovery_action": "desktop_screenshot" if observation_required else None,
+                    "session_policy": {
+                        "idle_timeout_seconds": idle_timeout,
+                        "local_session_active": local_session_active,
+                        "idle_remaining_seconds": (
+                            max(0.0, last_activity + idle_timeout - time.monotonic())
+                            if release_pending and idle_timeout else None
+                        ),
+                        "auto_release_count": auto_release_count,
+                    },
+                }, ensure_ascii=False)
             return result
         finally:
             action_lock.release()
@@ -434,23 +565,22 @@ def create_server(
             default_capture if capture_max_width is None else _capture_params(capture_max_width)
         )
         return await serialized(lambda deadline: action_and_frame(method, params, view_id, capture_params, deadline),
-                                input_action=True, frame_result=True)
+                                input_action=True, frame_result=True, desktop_activity=True)
 
-    def status_with_recovery(method: str, deadline: float) -> str:
+    def status_with_recovery(method: str, deadline: float) -> dict[str, Any]:
         result = connection.request(method, deadline=deadline)
-        if not isinstance(result, dict) or {"observation_required", "recovery_action"} & result.keys():
+        if not isinstance(result, dict) or {"observation_required", "recovery_action", "session_policy"} & result.keys():
             raise TransportError("SSH agent returned conflicting status metadata")
-        return json.dumps({**result, "observation_required": observation_required,
-                           "recovery_action": "desktop_screenshot" if observation_required else None},
-                          ensure_ascii=False)
+        return result
 
     @server.tool(description="Show connection and desktop dimensions for the authorized Raspberry Pi.", annotations=read_only)
     async def desktop_status() -> str:
-        return await serialized(lambda deadline: status_with_recovery("status", deadline))
+        return await serialized(lambda deadline: status_with_recovery("status", deadline),
+                                desktop_activity=True, status_result=True)
 
     @server.tool(description="Check Pi agent and desktop prerequisites without acquiring a session. This does not reserve the desktop or guarantee a later capture.", annotations=read_only)
     async def desktop_health() -> str:
-        return await serialized(lambda deadline: status_with_recovery("health", deadline))
+        return await serialized(lambda deadline: status_with_recovery("health", deadline), status_result=True)
 
     @server.tool(description="Capture the Pi desktop, optionally a source region in original pixels and/or a downscaled image. The returned view_id enables image-pixel mouse coordinates.", annotations=read_only, structured_output=False)
     async def desktop_screenshot(
@@ -461,7 +591,7 @@ def create_server(
         params = _screenshot_params(x, y, width, height, max_width)
         return await serialized(
             lambda deadline: _validated_frame(connection.request("screenshot", params, deadline=deadline), params),
-            observation="x" not in params, frame_result=True,
+            observation="x" not in params, frame_result=True, desktop_activity=True,
         )
 
     @server.tool(description="Observe sampled desktop pixels until unchanged for the requested duration, or sampling times out. Returns the last image and stability status; sampled equality does not prove the app is ready. A full desktop_screenshot is still required to recover from an uncertain input.", annotations=read_only, structured_output=False)
@@ -477,12 +607,13 @@ def create_server(
             lambda deadline: _validated_wait_frame(
                 connection.request("wait_for_stable", params, deadline=deadline), params,
             ),
-            frame_result=True,
+            frame_result=True, desktop_activity=True,
         )
 
     @server.tool(description="Release this bridge's Pi desktop session. The MCP server can reconnect on the next tool call.", annotations=release_tool)
     async def desktop_disconnect() -> str:
-        acknowledgement = await serialized(lambda deadline: connection.disconnect(deadline=deadline), invalidate_view=True)
+        acknowledgement = await serialized(lambda deadline: connection.disconnect(deadline=deadline),
+                                           invalidate_view=True, release_session=True)
         if acknowledgement.get("ok") is not True:
             raise TransportError("Remote agent did not confirm the desktop release")
         return "Desktop session released. A fresh screenshot is required before further input if an earlier action had an uncertain outcome."

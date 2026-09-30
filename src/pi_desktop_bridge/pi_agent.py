@@ -41,7 +41,7 @@ MAX_PNG_BYTES = MAX_PIXELS * 4 + MAX_TEXT_BYTES
 MAX_PPM_HEADER = 256
 MAX_PPM_BYTES = MAX_PIXELS * 3 + MAX_PPM_HEADER
 PROTOCOL_VERSION = 4
-AGENT_VERSION = "0.4.0"
+AGENT_VERSION = "0.5.0"
 # Identify the source that this process loaded, even if deployment replaces it.
 AGENT_SHA256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
 

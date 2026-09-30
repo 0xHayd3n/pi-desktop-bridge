@@ -2,20 +2,41 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import queue
 import re
+import shlex
 import subprocess
 import threading
 import time
 from collections import deque
+from pathlib import Path
 from typing import Any
 
 from . import PROTOCOL_VERSION
 
 
 AGENT_PATH = "~/.local/share/pi-desktop-bridge/pi_agent.py"
+# Pin the packaged source for this client process. Updating the package on disk
+# requires restarting the client before it can use a newly deployed agent.
+EXPECTED_AGENT_SHA256 = hashlib.sha256(Path(__file__).with_name("pi_agent.py").read_bytes()).hexdigest()
+# Execute the same bounded snapshot whose hash hello will advertise, even if
+# deployment atomically replaces the file while its imports are running.
+AGENT_BOOTSTRAP = """
+import hashlib
+from pathlib import Path
+path = Path.home() / '.local/share/pi-desktop-bridge/pi_agent.py'
+with path.open('rb') as stream:
+    source = stream.read(1048577)
+if not source or len(source) > 1048576:
+    raise RuntimeError('Pi agent source is empty or exceeds the byte limit')
+namespace = {'__name__': '__pi_desktop_agent_snapshot__', '__file__': str(path)}
+exec(compile(source, str(path), 'exec'), namespace)
+namespace['AGENT_SHA256'] = hashlib.sha256(source).hexdigest()
+namespace['main']()
+""".strip()
 # The agent permits PNG data up to 16 MP * 4 bytes plus 1 MiB. Base64 can
 # exceed 86 MiB, so retain a bounded pipe with room for JSON framing.
 MAX_RESPONSE_BYTES = 96 * 1024 * 1024
@@ -23,6 +44,7 @@ MAX_RESPONSE_BYTES = 96 * 1024 * 1024
 MAX_REQUEST_BYTES = 65_536
 _HOST_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,252}$", re.ASCII)
 _ERROR_CODE_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$", re.ASCII)
+_AGENT_SHA256_RE = re.compile(r"[0-9a-f]{64}", re.ASCII)
 REQUIRED_CAPABILITIES = frozenset({
     "hello", "health", "status", "screenshot", "wait_for_stable", "move", "click", "drag",
     "scroll", "type_text", "key", "disconnect",
@@ -100,11 +122,10 @@ class SSHTransport:
         return min(own, deadline) if deadline is not None else own
 
     def _start(self) -> None:
-        # The remote path is fixed code, not derived from tool arguments. The
-        # leading tilde is intentionally unquoted for the remote shell to expand.
+        # The bootstrap and agent path are fixed code, never tool arguments.
         try:
             proc = subprocess.Popen(
-                ssh_argv(self.host, f"python3 -u {AGENT_PATH}"),
+                ssh_argv(self.host, "python3 -u -c " + shlex.quote(AGENT_BOOTSTRAP)),
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 bufsize=0, env=_ssh_environment(),
             )
@@ -267,9 +288,14 @@ class SSHTransport:
         try:
             hello = self._exchange("hello", {}, deadline)
             capabilities = hello.get("capabilities")
+            agent_version = hello.get("agent_version")
+            agent_sha256 = hello.get("agent_sha256")
             if (
                 type(hello.get("protocol_version")) is not int
                 or hello["protocol_version"] != PROTOCOL_VERSION
+                or not isinstance(agent_version, str) or not 0 < len(agent_version) <= 64
+                or not agent_version.strip()
+                or not isinstance(agent_sha256, str) or _AGENT_SHA256_RE.fullmatch(agent_sha256) is None
                 or not isinstance(capabilities, list)
                 or not all(isinstance(item, str) for item in capabilities)
                 or not REQUIRED_CAPABILITIES.issubset(capabilities)
@@ -302,6 +328,12 @@ class SSHTransport:
             if method == "hello":
                 assert self._hello is not None
                 return dict(self._hello)
+            assert self._hello is not None
+            if method not in {"health", "disconnect"} and self._hello["agent_sha256"] != EXPECTED_AGENT_SHA256:
+                raise TransportError(
+                    "Deployed Pi agent source differs from this client. Deploy the latest agent and restart the MCP server.",
+                    code="agent_source_mismatch", input_state="not_started",
+                )
             try:
                 return self._exchange(method, params or {}, budget_end)
             except RemoteAgentError:
