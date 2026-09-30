@@ -1,0 +1,18 @@
+[build-system]
+requires = ["hatchling>=1.27,<2"]
+build-backend = "hatchling.build"
+
+[project]
+name = "pi-desktop-bridge"
+version = "0.1.0"
+description = "Give MCP-enabled assistants screenshot and input access to a Raspberry Pi desktop over SSH."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+dependencies = ["mcp>=1.20,<2"]
+
+[project.scripts]
+pi-desktop-bridge = "pi_desktop_bridge.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/pi_desktop_bridge"]

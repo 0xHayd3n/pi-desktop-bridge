@@ -1,0 +1,13 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json",
+  "mcpServers": {
+    "pi_desktop": {
+      "type": "stdio",
+      "command": "uv",
+      "args": ["--directory", "${PLUGIN_ROOT}", "run", "--frozen", "pi-desktop-bridge", "serve"],
+      "env": {
+        "UV_PROJECT_ENVIRONMENT": "${PLUGIN_DATA}/venv"
+      }
+    }
+  }
+}

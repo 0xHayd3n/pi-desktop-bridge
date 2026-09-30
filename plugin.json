@@ -1,0 +1,10 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "pi-desktop-bridge",
+  "version": "0.1.0",
+  "description": "See and operate a Raspberry Pi Wayland desktop through SSH-backed MCP tools.",
+  "author": { "name": "0xHayd3n" },
+  "repository": "https://github.com/0xHayd3n/pi-desktop-bridge",
+  "license": "MIT",
+  "keywords": ["raspberry-pi", "desktop", "mcp", "ssh", "wayland"]
+}

@@ -1,0 +1,11 @@
+{
+  "name": "pi-desktop-bridge",
+  "plugins": [
+    {
+      "name": "pi-desktop-bridge",
+      "source": { "source": "local", "path": "./" },
+      "policy": { "installation": "AVAILABLE", "authentication": "ON_INSTALL" },
+      "category": "Productivity"
+    }
+  ]
+}
