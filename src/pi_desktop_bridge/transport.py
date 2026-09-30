@@ -24,7 +24,7 @@ MAX_REQUEST_BYTES = 65_536
 _HOST_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,252}$", re.ASCII)
 _ERROR_CODE_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$", re.ASCII)
 REQUIRED_CAPABILITIES = frozenset({
-    "hello", "health", "status", "screenshot", "move", "click", "drag",
+    "hello", "health", "status", "screenshot", "wait_for_stable", "move", "click", "drag",
     "scroll", "type_text", "key", "disconnect",
 })
 

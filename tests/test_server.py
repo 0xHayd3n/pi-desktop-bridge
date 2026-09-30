@@ -94,6 +94,21 @@ class ViewTransport(FakeTransport):
                      region=region, frame_id=f"{self.next_frame:032x}")
 
 
+class WaitTransport(ViewTransport):
+    def request(self, method: str, params: dict | None = None, *, deadline: float | None = None) -> dict:
+        if method != "wait_for_stable":
+            return super().request(method, params, deadline=deadline)
+        requested = params or {}
+        result = super().request("screenshot", requested, deadline=deadline)
+        self.calls[-1] = (method, requested)
+        result["stability"] = {
+            "stable": True, "timed_out": False, "elapsed_ms": requested["stable_ms"],
+            "samples": 2, "stable_ms": requested["stable_ms"],
+            "timeout_ms": requested["timeout_ms"], "poll_ms": requested["poll_ms"],
+        }
+        return result
+
+
 class StdioFixtureTransport(FakeTransport):
     """Exercise the real MCP stdio path without SSH or desktop input."""
 
@@ -156,13 +171,19 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(set(tools), {
             "desktop_status", "desktop_screenshot", "desktop_move", "desktop_click",
             "desktop_drag", "desktop_scroll", "desktop_type", "desktop_key",
-            "desktop_health", "desktop_disconnect",
+            "desktop_health", "desktop_disconnect", "desktop_wait_for_stable",
         })
         self.assertTrue(tools["desktop_screenshot"].annotations.readOnlyHint)
+        self.assertTrue(tools["desktop_wait_for_stable"].annotations.readOnlyHint)
         self.assertTrue(tools["desktop_click"].annotations.destructiveHint)
         self.assertIn("['Control_L','a']", tools["desktop_key"].description)
         screenshot = tools["desktop_screenshot"].inputSchema["properties"]
         self.assertEqual(set(screenshot), {"x", "y", "width", "height", "max_width"})
+        self.assertEqual(set(tools["desktop_wait_for_stable"].inputSchema["properties"]),
+                         {"x", "y", "width", "height", "max_width", "stable_ms", "timeout_ms", "poll_ms"})
+        for name in ("desktop_move", "desktop_click", "desktop_drag", "desktop_scroll",
+                     "desktop_type", "desktop_key"):
+            self.assertIn("capture_max_width", tools[name].inputSchema["properties"])
         for name in ("desktop_move", "desktop_click", "desktop_drag", "desktop_scroll"):
             self.assertIn("view_id", tools[name].inputSchema["properties"])
         for name in ("desktop_type", "desktop_key"):
@@ -180,6 +201,76 @@ class ServerTests(unittest.TestCase):
         image = next(item for item in result if isinstance(item, ImageContent))
         self.assertEqual(image.mimeType, "image/png")
         self.assertEqual(base64.b64decode(image.data), PNG)
+
+    def test_capture_width_default_override_and_all_six_action_schemas(self) -> None:
+        fake = ViewTransport()
+        server = create_server("pi-desktop", transport=fake, capture_max_width=20)
+        actions = (
+            ("desktop_move", {"x": 1, "y": 1}),
+            ("desktop_click", {"x": 1, "y": 1}),
+            ("desktop_drag", {"start_x": 1, "start_y": 1, "end_x": 2, "end_y": 2}),
+            ("desktop_scroll", {"direction": "up"}),
+            ("desktop_type", {"text": "hello"}),
+            ("desktop_key", {"keys": ["Return"]}),
+        )
+        for tool, args in actions:
+            result = asyncio.run(server.call_tool(tool, args))
+            self.assertEqual(json.loads(result[0].text)["width"], 20, tool)
+            self.assertEqual(fake.calls[-1], ("screenshot", {"max_width": 20}), tool)
+            self.assertNotIn("max_width", fake.calls[-2][1], tool)
+            result = asyncio.run(server.call_tool(tool, {**args, "capture_max_width": 10}))
+            self.assertEqual(json.loads(result[0].text)["width"], 10, tool)
+            self.assertEqual(fake.calls[-1], ("screenshot", {"max_width": 10}), tool)
+        result = asyncio.run(server.call_tool("desktop_move", {"x": 1, "y": 1,
+                                                               "capture_max_width": 65535}))
+        self.assertEqual(json.loads(result[0].text)["width"], 100)
+        self.assertEqual(fake.calls[-1], ("screenshot", {"max_width": 65535}))
+        explicit = asyncio.run(server.call_tool("desktop_screenshot", {}))
+        self.assertEqual(json.loads(explicit[0].text)["width"], 100)
+        self.assertEqual(fake.calls[-1], ("screenshot", {}))
+
+    def test_invalid_capture_policy_rejected_before_input(self) -> None:
+        for invalid in (0, 65536, True, 1.5, "20"):
+            with self.subTest(config=invalid), self.assertRaises(Exception):
+                create_server("pi-desktop", transport=FakeTransport(), capture_max_width=invalid)
+        fake = ViewTransport()
+        server = create_server("pi-desktop", transport=fake, capture_max_width=20)
+        actions = (
+            ("desktop_move", {"x": 1, "y": 1}),
+            ("desktop_click", {"x": 1, "y": 1}),
+            ("desktop_drag", {"start_x": 1, "start_y": 1, "end_x": 2, "end_y": 2}),
+            ("desktop_scroll", {"direction": "up"}),
+            ("desktop_type", {"text": "hello"}),
+            ("desktop_key", {"keys": ["Return"]}),
+        )
+        for tool, args in actions:
+            for invalid in (0, 65536, True, "20", 20.0):
+                with self.subTest(tool=tool, width=invalid), self.assertRaises(Exception):
+                    asyncio.run(server.call_tool(tool, {**args, "capture_max_width": invalid}))
+        self.assertEqual(fake.calls, [])
+
+    def test_post_action_capture_must_match_requested_width_and_full_source(self) -> None:
+        class WrongCapture(ViewTransport):
+            def __init__(self, wrong_region: bool = False) -> None:
+                super().__init__()
+                self.wrong_region = wrong_region
+
+            def request(self, method: str, params: dict | None = None, *, deadline: float | None = None) -> dict:
+                if method != "screenshot":
+                    return super().request(method, params, deadline=deadline)
+                # Valid PNG and internally consistent metadata, but wrong output scope.
+                returned = ({"x": 0, "y": 0, "width": 50, "height": 80, "max_width": 20}
+                            if self.wrong_region else {"max_width": 21})
+                return super().request(method, returned, deadline=deadline)
+
+        for wrong_region in (False, True):
+            with self.subTest(wrong_region=wrong_region):
+                fake = WrongCapture(wrong_region)
+                server = create_server("pi-desktop", transport=fake, capture_max_width=20)
+                with self.assertRaisesRegex(Exception, "fresh screenshot is unavailable"):
+                    asyncio.run(server.call_tool("desktop_click", {"x": 1, "y": 1}))
+                with self.assertRaisesRegex(Exception, "previous input outcome is uncertain"):
+                    asyncio.run(server.call_tool("desktop_move", {"x": 1, "y": 1}))
 
     def test_concurrent_actions_keep_each_result_with_its_fresh_frame(self) -> None:
         class SlowTransport(FakeTransport):
@@ -265,6 +356,204 @@ class ServerTests(unittest.TestCase):
         asyncio.run(server.call_tool("desktop_screenshot", {}))
         result = asyncio.run(server.call_tool("desktop_click", {"x": 1, "y": 1}))
         self.assertTrue(any(isinstance(item, ImageContent) for item in result))
+
+    def test_wait_schema_defaults_crop_timeout_and_view_mapping(self) -> None:
+        fake = WaitTransport()
+        server = create_server("pi-desktop", transport=fake, capture_max_width=20)
+        first = asyncio.run(server.call_tool("desktop_wait_for_stable", {}))
+        self.assertEqual(fake.calls[-1], ("wait_for_stable", {
+            "stable_ms": 300, "timeout_ms": 5000, "poll_ms": 100,
+        }))
+        first_meta = json.loads(first[0].text)
+        self.assertEqual(first_meta["width"], 100)
+        self.assertEqual(first_meta["stability"], {
+            "stable": True, "timed_out": False, "elapsed_ms": 300, "samples": 2,
+            "stable_ms": 300, "timeout_ms": 5000, "poll_ms": 100,
+        })
+        crop = asyncio.run(server.call_tool("desktop_wait_for_stable", {
+            "x": 10, "y": 20, "width": 8, "height": 4, "max_width": 4,
+            "stable_ms": 200, "timeout_ms": 600, "poll_ms": 50,
+        }))
+        crop_meta = json.loads(crop[0].text)
+        self.assertEqual((crop_meta["width"], crop_meta["height"]), (4, 2))
+        self.assertEqual(crop_meta["region"], {"x": 10, "y": 20, "width": 8, "height": 4})
+        self.assertEqual(fake.calls[-1][1], {
+            "x": 10, "y": 20, "width": 8, "height": 4, "max_width": 4,
+            "stable_ms": 200, "timeout_ms": 600, "poll_ms": 50,
+        })
+        before = len(fake.calls)
+        with self.assertRaisesRegex(Exception, "stale_view"):
+            asyncio.run(server.call_tool("desktop_click", {
+                "x": 0, "y": 0, "view_id": first_meta["view_id"],
+            }))
+        self.assertEqual(len(fake.calls), before)
+        asyncio.run(server.call_tool("desktop_click", {
+            "x": 0, "y": 0, "view_id": crop_meta["view_id"],
+        }))
+        self.assertEqual(fake.calls[-2][1]["x"], 11)
+        self.assertEqual(fake.calls[-2][1]["y"], 21)
+        self.assertEqual(fake.calls[-2][1]["frame_id"], crop_meta["view_id"])
+        self.assertEqual(fake.calls[-1], ("screenshot", {"max_width": 20}))
+
+    def test_wait_invalid_parameters_rejected_before_transport(self) -> None:
+        fake = WaitTransport()
+        server = create_server("pi-desktop", transport=fake)
+        cases = (
+            {"x": 1}, {"max_width": 0}, {"stable_ms": 49},
+            {"stable_ms": 2001}, {"timeout_ms": 99}, {"timeout_ms": 10001},
+            {"poll_ms": 49}, {"poll_ms": 1001},
+            {"stable_ms": 100, "poll_ms": 101},
+            {"stable_ms": 101, "timeout_ms": 100},
+            {"stable_ms": True}, {"poll_ms": "100"}, {"timeout_ms": 100.0},
+        )
+        for args in cases:
+            with self.subTest(args=args), self.assertRaises(Exception):
+                asyncio.run(server.call_tool("desktop_wait_for_stable", args))
+        self.assertEqual(fake.calls, [])
+
+    def test_wait_rejects_invalid_metadata_and_image_and_invalidates_old_view(self) -> None:
+        class DamagedWait(WaitTransport):
+            def __init__(self) -> None:
+                super().__init__()
+                self.change = lambda result: None
+
+            def request(self, method: str, params: dict | None = None, *, deadline: float | None = None) -> dict:
+                result = super().request(method, params, deadline=deadline)
+                if method == "wait_for_stable":
+                    self.change(result)
+                return result
+
+        fake = DamagedWait()
+        server = create_server("pi-desktop", transport=fake)
+        for change in (
+            lambda result: result["stability"].update(stable=True, timed_out=True),
+            lambda result: result["stability"].update(elapsed_ms=299),
+            lambda result: result["stability"].update(samples=1),
+            lambda result: result["stability"].update(samples=202),
+            lambda result: result["stability"].update(elapsed_ms=11001),
+            lambda result: result["stability"].update(elapsed_ms=5001),
+            lambda result: result["stability"].update(stable=False, timed_out=True, elapsed_ms=4999),
+            lambda result: result["stability"].update(stable_ms=301),
+            lambda result: result["stability"].update(samples=True),
+            lambda result: result["stability"].update(extra=1),
+            lambda result: result.update(width=99),
+        ):
+            fake.change = lambda result: None
+            current = json.loads(asyncio.run(server.call_tool("desktop_screenshot", {}))[0].text)["view_id"]
+            fake.change = change
+            with self.subTest(change=change), self.assertRaises(Exception):
+                asyncio.run(server.call_tool("desktop_wait_for_stable", {}))
+            before = len(fake.calls)
+            with self.assertRaisesRegex(Exception, "stale_view"):
+                asyncio.run(server.call_tool("desktop_move", {"x": 0, "y": 0, "view_id": current}))
+            self.assertEqual(len(fake.calls), before)
+
+    def test_wait_timeout_preserves_guard_and_status_recovery_hints(self) -> None:
+        class UncertainThenTimeout(WaitTransport):
+            def __init__(self) -> None:
+                super().__init__()
+                self.timeout_result = True
+
+            def request(self, method: str, params: dict | None = None, *, deadline: float | None = None) -> dict:
+                if method == "click":
+                    self.calls.append((method, params or {}))
+                    raise RemoteAgentError("input_failed", "outcome unknown", "may_have_executed")
+                result = super().request(method, params, deadline=deadline)
+                if method == "wait_for_stable" and self.timeout_result:
+                    result["stability"].update(stable=False, timed_out=True, elapsed_ms=5000,
+                                               samples=3)
+                return result
+
+        fake = UncertainThenTimeout()
+        server = create_server("pi-desktop", transport=fake)
+        def status_data(tool: str) -> dict:
+            return json.loads(asyncio.run(server.call_tool(tool, {}))[0][0].text)
+
+        for tool in ("desktop_status", "desktop_health"):
+            initial = status_data(tool)
+            self.assertIs(initial["observation_required"], False)
+            self.assertIsNone(initial["recovery_action"])
+        with self.assertRaisesRegex(Exception, "Input may have executed"):
+            asyncio.run(server.call_tool("desktop_click", {"x": 1, "y": 1}))
+        for tool in ("desktop_status", "desktop_health"):
+            state = status_data(tool)
+            self.assertIs(state["observation_required"], True)
+            self.assertEqual(state["recovery_action"], "desktop_screenshot")
+            self.assertIn("hostname" if tool == "desktop_status" else "desktop_ready", state)
+        waited = asyncio.run(server.call_tool("desktop_wait_for_stable", {}))
+        metadata = json.loads(waited[0].text)
+        self.assertEqual(metadata["stability"]["stable"], False)
+        self.assertEqual(metadata["stability"]["timed_out"], True)
+        self.assertTrue(any(isinstance(item, ImageContent) for item in waited))
+        fake.timeout_result = False
+        stable_wait = asyncio.run(server.call_tool("desktop_wait_for_stable", {}))
+        self.assertIs(json.loads(stable_wait[0].text)["stability"]["stable"], True)
+        asyncio.run(server.call_tool("desktop_disconnect", {}))
+        with self.assertRaisesRegex(Exception, "previous input outcome is uncertain"):
+            asyncio.run(server.call_tool("desktop_move", {"x": 1, "y": 1,
+                                                           "view_id": metadata["view_id"]}))
+        self.assertEqual(status_data("desktop_health")["recovery_action"],
+                         "desktop_screenshot")
+        asyncio.run(server.call_tool("desktop_screenshot", {}))
+        self.assertIsNone(status_data("desktop_status")["recovery_action"])
+
+    def test_cancelled_wait_keeps_serialization_and_invalidates_old_view(self) -> None:
+        class BlockingWait(WaitTransport):
+            def __init__(self) -> None:
+                super().__init__()
+                self.started = threading.Event()
+                self.release = threading.Event()
+
+            def request(self, method: str, params: dict | None = None, *, deadline: float | None = None) -> dict:
+                if method == "wait_for_stable":
+                    self.started.set()
+                    self.release.wait(timeout=2)
+                return super().request(method, params, deadline=deadline)
+
+        fake = BlockingWait()
+        server = create_server("pi-desktop", transport=fake)
+
+        async def cancelled_wait() -> None:
+            view = json.loads((await server.call_tool("desktop_screenshot", {}))[0].text)["view_id"]
+            active = asyncio.create_task(server.call_tool("desktop_wait_for_stable", {}))
+            async with asyncio.timeout(1):
+                while not fake.started.is_set():
+                    await asyncio.sleep(0.005)
+            active.cancel()
+            health = asyncio.create_task(server.call_tool("desktop_health", {}))
+            try:
+                await asyncio.sleep(0.03)
+                self.assertFalse(active.done())
+                self.assertFalse(health.done())
+            finally:
+                fake.release.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await active
+            await health
+            with self.assertRaisesRegex(Exception, "stale_view"):
+                await server.call_tool("desktop_move", {"x": 0, "y": 0, "view_id": view})
+
+        asyncio.run(cancelled_wait())
+        self.assertEqual([method for method, _ in fake.calls],
+                         ["screenshot", "wait_for_stable", "health"])
+
+    def test_failed_wait_preserves_uncertain_input_recovery(self) -> None:
+        class FailedWait(WaitTransport):
+            def request(self, method: str, params: dict | None = None, *, deadline: float | None = None) -> dict:
+                if method == "click":
+                    raise RemoteAgentError("input_failed", "outcome unknown", "may_have_executed")
+                if method == "wait_for_stable":
+                    raise TransportError("sampling failed", input_state="not_started")
+                return super().request(method, params, deadline=deadline)
+
+        fake = FailedWait()
+        server = create_server("pi-desktop", transport=fake)
+        with self.assertRaisesRegex(Exception, "Input may have executed"):
+            asyncio.run(server.call_tool("desktop_click", {"x": 1, "y": 1}))
+        with self.assertRaisesRegex(Exception, "sampling failed"):
+            asyncio.run(server.call_tool("desktop_wait_for_stable", {}))
+        with self.assertRaisesRegex(Exception, "previous input outcome is uncertain"):
+            asyncio.run(server.call_tool("desktop_move", {"x": 1, "y": 1}))
 
     def test_targeted_scroll_forwards_original_pixel_coordinates(self) -> None:
         fake = FakeTransport()

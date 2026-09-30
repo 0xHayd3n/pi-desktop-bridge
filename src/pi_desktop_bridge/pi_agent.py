@@ -27,6 +27,11 @@ try:
 except ImportError:  # The controller and unit tests can import this on Windows.
     fcntl = None
 
+try:
+    import resource
+except ImportError:  # Only the Linux capture child uses resource limits.
+    resource = None
+
 
 MAX_PIXELS = 16_777_216
 MAX_TEXT_BYTES = 1_048_576
@@ -35,8 +40,8 @@ MAX_REQUEST_BYTES = 65_536
 MAX_PNG_BYTES = MAX_PIXELS * 4 + MAX_TEXT_BYTES
 MAX_PPM_HEADER = 256
 MAX_PPM_BYTES = MAX_PIXELS * 3 + MAX_PPM_HEADER
-PROTOCOL_VERSION = 3
-AGENT_VERSION = "0.3.0"
+PROTOCOL_VERSION = 4
+AGENT_VERSION = "0.4.0"
 # Identify the source that this process loaded, even if deployment replaces it.
 AGENT_SHA256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
 
@@ -51,6 +56,10 @@ class AgentError(Exception):
 
     def as_dict(self):
         return {"code": self.code, "message": str(self), "input_state": self.input_state}
+
+
+class _SamplingDeadlineExpired(Exception):
+    """Internal budget exhaustion, distinct from failed capture or geometry."""
 
 
 def _dimensions(width, height):
@@ -149,7 +158,11 @@ def _ppm_header(output):
     return width, height, output.tell()
 
 
-def _ppm_png(output, desktop_width, desktop_height, region, max_width):
+def _validated_ppm(output, desktop_width, desktop_height):
+    output.seek(0, os.SEEK_END)
+    if output.tell() > MAX_PPM_BYTES:
+        raise AgentError("Compositor image exceeds the byte limit")
+    output.seek(0)
     source_width, source_height, raster_start = _ppm_header(output)
     if (source_width, source_height) != (desktop_width, desktop_height):
         raise AgentError("Compositor screenshot dimensions differ from the input desktop; reconnect after display changes",
@@ -157,6 +170,31 @@ def _ppm_png(output, desktop_width, desktop_height, region, max_width):
     output.seek(0, os.SEEK_END)
     if output.tell() != raster_start + source_width * source_height * 3:
         raise AgentError("Compositor PPM pixel payload has an invalid size")
+    return source_width, source_height, raster_start
+
+
+def _ppm_digest(output, desktop_width, desktop_height, region):
+    """Compare every native RGB pixel in the ROI, regardless of return size."""
+    source_width, _, raster_start = _validated_ppm(output, desktop_width, desktop_height)
+    x, y, width, height = region
+    digest = hashlib.sha256()
+    for row in range(y, y + height):
+        output.seek(raster_start + (row * source_width + x) * 3)
+        pixels = output.read(width * 3)
+        if len(pixels) != width * 3:
+            raise AgentError("Compositor PPM pixel payload is truncated")
+        digest.update(pixels)
+    return digest.digest()
+
+
+def _limit_capture_file():
+    # This standalone agent is single-threaded. Keep preexec work limited to
+    # the child's kernel file-size limit; the parent's limits never change.
+    resource.setrlimit(resource.RLIMIT_FSIZE, (MAX_PPM_BYTES, MAX_PPM_BYTES))
+
+
+def _ppm_png(output, desktop_width, desktop_height, region, max_width):
+    source_width, _, raster_start = _validated_ppm(output, desktop_width, desktop_height)
     x, y, width, height = region
     image_width = min(width, max_width if max_width is not None else width)
     image_height = max(1, height * image_width // width)
@@ -470,7 +508,7 @@ class OwnedWayVNC:
                 raise AgentError("WayVNC output power did not become ready before the startup deadline", code="timeout")
             time.sleep(min(0.02, remaining))
 
-    def _query_selected_output(self, deadline=None):
+    def _query_selected_output(self, deadline=None, sampling=False):
         """Query only our private control socket for the RFB pointer's output."""
         connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         if deadline is None:
@@ -478,6 +516,8 @@ class OwnedWayVNC:
         def set_timeout():
             remaining = deadline - time.monotonic()
             if remaining <= 0:
+                if sampling:
+                    raise _SamplingDeadlineExpired()
                 raise AgentError("WayVNC output query timed out")
             connection.settimeout(remaining)
         try:
@@ -517,18 +557,23 @@ class OwnedWayVNC:
                 return {"name": name, "width": width, "height": height, "power": output["power"], "captured": True}
             raise AgentError("WayVNC output response exceeds the byte limit")
         except socket.timeout as exc:
+            if sampling and time.monotonic() >= deadline:
+                raise _SamplingDeadlineExpired() from exc
             raise AgentError("WayVNC output query timed out") from exc
         except OSError as exc:
             raise AgentError("WayVNC output query failed: " + str(exc)) from exc
         finally:
             connection.close()
 
-    def check_geometry(self):
+    def check_geometry(self, deadline=None, sampling=False):
         """Reject stale input coordinates before sending any desktop events."""
         try:
-            current = self._query_selected_output()
+            current = (self._query_selected_output() if deadline is None else
+                       self._query_selected_output(deadline=deadline, sampling=sampling))
             if self.output_geometry is None or current != self.output_geometry:
                 raise AgentError("Desktop output changed; take a fresh screenshot before sending more input", code="geometry_changed")
+            if sampling and time.monotonic() >= deadline:
+                raise _SamplingDeadlineExpired()
         except AgentError as exc:
             if exc.code == "operation_failed":
                 exc.code = "preflight_failed"
@@ -601,6 +646,82 @@ class OwnedWayVNC:
             finally:
                 self._stop_capture()
 
+    def _capture_ppm(self, output, executable, deadline):
+        """Overwrite one bounded sample file under the sampling deadline."""
+        self.check_geometry(deadline=deadline, sampling=True)
+        output.seek(0)
+        output.truncate()
+        try:
+            if deadline <= time.monotonic():
+                raise _SamplingDeadlineExpired()
+            self.capture_process = subprocess.Popen(
+                [executable, "-c", "-t", "ppm", "-o", self.output_name, "-"],
+                stdin=subprocess.DEVNULL, stdout=output, stderr=sys.stderr,
+                env=self.environment, close_fds=True, start_new_session=True, umask=0o077,
+                **({"preexec_fn": _limit_capture_file} if resource is not None else {}),
+            )
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise _SamplingDeadlineExpired()
+            if self.capture_process.wait(timeout=remaining) != 0:
+                raise AgentError("grim could not capture the compositor output; see stderr diagnostics")
+        except subprocess.TimeoutExpired as exc:
+            if time.monotonic() >= deadline:
+                raise _SamplingDeadlineExpired() from exc
+            raise AgentError("Compositor capture timed out") from exc
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise AgentError("Compositor capture failed: " + str(exc)) from exc
+        finally:
+            self._stop_capture()
+
+    def wait_for_stable(self, region, max_width, stable_ms, timeout_ms, poll_ms):
+        """Observe sampled ROI equality; retain and encode the final sample."""
+        started = time.monotonic()
+        deadline = started + timeout_ms / 1000
+        executable = shutil.which("grim")
+        if not executable:
+            raise AgentError("Install the grim package on the Pi to capture its desktop", code="missing_dependency")
+        width, height = self.client.width, self.client.height
+        previous = None
+        unchanged_since = None
+        samples = 0
+        stable = False
+        # Keep the latest validated sample while a candidate is captured. Swap
+        # and reuse these two bounded anonymous files; never accumulate rasters.
+        with (tempfile.TemporaryFile(dir=self.directory) as latest,
+              tempfile.TemporaryFile(dir=self.directory) as candidate):
+            while time.monotonic() < deadline:
+                try:
+                    self._capture_ppm(candidate, executable, deadline)
+                    digest = _ppm_digest(candidate, width, height, region)
+                    self.check_geometry(deadline=deadline, sampling=True)
+                except _SamplingDeadlineExpired:
+                    break
+                sampled = time.monotonic()
+                if sampled > deadline:
+                    break
+                latest, candidate = candidate, latest
+                samples += 1
+                if digest != previous:
+                    unchanged_since = sampled
+                previous = digest
+                if samples >= 2 and sampled >= unchanged_since + stable_ms / 1000:
+                    stable = True
+                    break
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                time.sleep(min(poll_ms / 1000, remaining))
+            if not samples:
+                raise AgentError("Compositor capture timed out before a valid sample")
+            stability = {"stable": stable, "timed_out": not stable,
+                         "elapsed_ms": max(0, min(timeout_ms, round((time.monotonic() - started) * 1000))),
+                         "samples": samples, "stable_ms": stable_ms,
+                         "timeout_ms": timeout_ms, "poll_ms": poll_ms}
+            # PNG work is outside the sampling budget. No extra final capture.
+            png = _ppm_png(latest, width, height, region, max_width)
+        return png, stability
+
     def close(self):
         try:
             self._stop_capture()
@@ -658,6 +779,7 @@ WHEEL = {"up": 8, "down": 16, "left": 32, "right": 64}
 PARAMETERS = {
     "hello": set(), "health": set(),
     "status": set(), "screenshot": {"x", "y", "width", "height", "max_width"}, "disconnect": set(),
+    "wait_for_stable": {"x", "y", "width", "height", "max_width", "stable_ms", "timeout_ms", "poll_ms"},
     "move": {"x", "y", "frame_id"}, "click": {"x", "y", "button", "count", "frame_id"},
     "drag": {"start_x", "start_y", "end_x", "end_y", "button", "steps", "frame_id"},
     "scroll": {"x", "y", "direction", "ticks", "frame_id"}, "type_text": {"text"}, "key": {"keys"},
@@ -794,7 +916,7 @@ class DesktopAgent:
         if not isinstance(params, dict) or any(key not in PARAMETERS[method] for key in params):
             raise AgentError("Invalid parameters for " + method, code="invalid_params")
         prepared = {}
-        if method == "screenshot":
+        if method in ("screenshot", "wait_for_stable"):
             region_keys = {"x", "y", "width", "height"}
             present = region_keys.intersection(params)
             if present and present != region_keys:
@@ -808,6 +930,12 @@ class DesktopAgent:
                 prepared["region"] = (x, y, width, height)
             if "max_width" in params:
                 prepared["max_width"] = _integer(params["max_width"], "max_width", 1, 65535)
+            if method == "wait_for_stable":
+                prepared["stable_ms"] = _integer(params.get("stable_ms", 300), "stable_ms", 50, 2000)
+                prepared["timeout_ms"] = _integer(params.get("timeout_ms", 5000), "timeout_ms", 100, 10000)
+                prepared["poll_ms"] = _integer(params.get("poll_ms", 100), "poll_ms", 50, 1000)
+                if not prepared["poll_ms"] <= prepared["stable_ms"] <= prepared["timeout_ms"]:
+                    raise AgentError("Require poll_ms <= stable_ms <= timeout_ms", code="invalid_params")
         if method in ("move", "click", "drag", "scroll") and "frame_id" in params:
             frame_id = params["frame_id"]
             if type(frame_id) is not str or re.fullmatch(r"[0-9a-f]{32}", frame_id) is None:
@@ -925,14 +1053,17 @@ class DesktopAgent:
                 return {"hostname": socket.gethostname(), "width": self.client.width,
                         "height": self.client.height, "desktop_name": self.client.name,
                         "wayland_display": self.session.wayland_display}
-            if method == "screenshot":
+            if method in ("screenshot", "wait_for_stable"):
                 desktop_width, desktop_height = self.client.width, self.client.height
                 region = prepared.get("region", (0, 0, desktop_width, desktop_height))
                 x, y, width, height = region
                 if x + width > desktop_width or y + height > desktop_height:
                     raise AgentError("Screenshot region is outside desktop dimensions", code="invalid_params")
                 max_width = prepared.get("max_width")
-                if "region" in prepared or max_width is not None:
+                if method == "wait_for_stable":
+                    png, stability = self.session.wait_for_stable(
+                        region, max_width, prepared["stable_ms"], prepared["timeout_ms"], prepared["poll_ms"])
+                elif "region" in prepared or max_width is not None:
                     png = self.session.screenshot_png(region, max_width)
                 else:
                     png = self.session.screenshot_png()
@@ -943,6 +1074,8 @@ class DesktopAgent:
                           "desktop_width": desktop_width, "desktop_height": desktop_height,
                           "region": {"x": x, "y": y, "width": width, "height": height},
                           "frame_id": secrets.token_hex(16)}
+                if method == "wait_for_stable":
+                    result["stability"] = stability
                 self.latest_frame_id = result["frame_id"]
                 self.latest_frame_client = self.client
                 return result

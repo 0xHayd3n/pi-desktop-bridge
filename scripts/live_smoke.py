@@ -119,7 +119,7 @@ async def exercise(host, output):
             async with ClientSession(*streams) as session:
                 await session.initialize()
                 report["tools"] = [tool.name for tool in (await session.list_tools()).tools]
-                assert len(report["tools"]) == 10, report["tools"]
+                assert len(report["tools"]) == 11, report["tools"]
 
                 async def call(name, arguments=None, image_name=None):
                     result = await session.call_tool(name, arguments or {})
@@ -145,7 +145,7 @@ async def exercise(host, output):
                         return transport.request("status")
 
                 health = json_content(await call("desktop_health"))
-                assert health["desktop_ready"] and health["protocol_version"] == 3, health
+                assert health["desktop_ready"] and health["protocol_version"] == 4, health
                 assert health["session_active"] is False, health
                 report["checks"]["lease_free_health"] = True
                 rejected = await session.call_tool("desktop_click", {"x": 0, "y": 0, "button": "invalid"})

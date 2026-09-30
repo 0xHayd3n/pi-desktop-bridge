@@ -13,7 +13,8 @@ def main():
     root.title("Pi Desktop Bridge — verification")
     root.geometry("640x430+200+150")
     root.attributes("-topmost", True)
-    state = {"clicks": 0, "scrolls": 0, "hotkeys": 0, "drag": [], "text": "", "button_events": []}
+    state = {"clicks": 0, "scrolls": 0, "hotkeys": 0, "drag": [], "text": "", "button_events": [],
+             "visual": {"mode": "idle", "ticks": 0, "color": "#333333"}}
     text = tk.StringVar()
 
     def save(*_):
@@ -56,6 +57,40 @@ def main():
     for index, color in enumerate(("#ff0000", "#00ff00", "#0000ff", "#ffffff")):
         canvas.create_rectangle(20 + index * 10, 72, 27 + index * 10, 79,
                                 fill=color, outline="")
+    visual_patch = canvas.create_rectangle(450, 60, 510, 120, fill="#333333", outline="")
+    command_path = state_path.with_name("command.json")
+    visual_job = None
+
+    def visual_tick():
+        nonlocal visual_job
+        visual = state["visual"]
+        visual["ticks"] += 1
+        if visual["mode"] == "settle" and visual["ticks"] >= 6:
+            visual.update(mode="settled", color="#00ff00")
+            visual_job = None
+        else:
+            visual["color"] = "#ff0000" if visual["ticks"] % 2 else "#0000ff"
+            visual_job = root.after(75, visual_tick)
+        canvas.itemconfigure(visual_patch, fill=visual["color"])
+        save()
+
+    def read_command():
+        nonlocal visual_job
+        if command_path.exists():
+            command = json.loads(command_path.read_text(encoding="utf-8"))
+            command_path.unlink()
+            if command.get("mode") not in {"settle", "animate", "idle"} or not isinstance(command.get("id"), str):
+                raise ValueError("Invalid fixture command")
+            if visual_job is not None:
+                root.after_cancel(visual_job)
+                visual_job = None
+            state["visual"] = {"mode": command["mode"], "ticks": 0, "color": "#333333",
+                               "command_id": command["id"]}
+            canvas.itemconfigure(visual_patch, fill="#333333")
+            if command["mode"] != "idle":
+                visual_job = root.after(75, visual_tick)
+            save()
+        root.after(25, read_command)
 
     def drag_start(event):
         state["drag"] = [[event.x, event.y]]
@@ -89,6 +124,7 @@ def main():
         entry.focus_force()
 
     root.after(300, ready)
+    root.after(25, read_command)
     root.mainloop()
 
 

@@ -79,5 +79,32 @@ class DoctorTests(unittest.TestCase):
             self.assertEqual(json.loads(output.getvalue()), {"ready": ready})
 
 
+class ServeTests(unittest.TestCase):
+    def test_capture_default_and_override_reach_server(self):
+        for width in (None, 960, 65_535):
+            with self.subTest(width=width):
+                args = ["serve", "--host", "pi-desktop"]
+                if width is not None:
+                    args += ["--capture-max-width", str(width)]
+                transport = mock.MagicMock()
+                transport.__enter__.return_value = transport
+                with mock.patch.object(cli, "SSHTransport", return_value=transport), \
+                        mock.patch.object(cli, "create_server") as create:
+                    self.assertEqual(cli.main(args), 0)
+                create.assert_called_once_with("pi-desktop", transport=transport, capture_max_width=width)
+                create.return_value.run.assert_called_once_with(transport="stdio")
+                transport.request.assert_not_called()
+                transport.__exit__.assert_called_once()
+
+    def test_bad_capture_policy_rejected_before_connection(self):
+        for value in ("0", "-1", "65536", "true", "960.0", "no"):
+            with self.subTest(value=value), mock.patch.object(cli, "SSHTransport") as transport, \
+                    contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as raised:
+                    cli.main(["serve", "--capture-max-width", value])
+                self.assertEqual(raised.exception.code, 2)
+                transport.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

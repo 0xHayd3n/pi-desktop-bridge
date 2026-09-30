@@ -129,6 +129,8 @@ def _valid_png(data: bytes, width: int, height: int) -> bool:
 def _validated_frame(
     result: dict[str, Any], requested: dict[str, Any] | None = None,
 ) -> tuple[list[TextContent | ImageContent], FrameView]:
+    if not isinstance(result, dict):
+        raise TransportError("SSH agent returned invalid screenshot metadata")
     encoded = result.get("image_base64")
     mime = result.get("mime_type")
     width = result.get("width")
@@ -218,8 +220,67 @@ def _screenshot_params(
     return params
 
 
-def create_server(host: str, *, transport: SSHTransport | None = None) -> FastMCP:
+def _capture_params(max_width: int | None) -> dict[str, int]:
+    """Validate a post-action width before there is any chance of input."""
+    return _screenshot_params(None, None, None, None, max_width)
+
+
+def _wait_params(
+    x: int | None, y: int | None, width: int | None, height: int | None,
+    max_width: int | None, stable_ms: int, timeout_ms: int, poll_ms: int,
+) -> dict[str, int]:
+    params = _screenshot_params(x, y, width, height, max_width)
+    if (
+        type(stable_ms) is not int or not 50 <= stable_ms <= 2000
+        or type(timeout_ms) is not int or not 100 <= timeout_ms <= 10000
+        or type(poll_ms) is not int or not 50 <= poll_ms <= 1000
+        or not poll_ms <= stable_ms <= timeout_ms
+    ):
+        raise TransportError("Invalid stability timing: require 50 <= poll_ms <= stable_ms <= timeout_ms, stable_ms <= 2000, poll_ms <= 1000, timeout_ms <= 10000", input_state="not_started")
+    params.update(stable_ms=stable_ms, timeout_ms=timeout_ms, poll_ms=poll_ms)
+    return params
+
+
+def _validated_stability(result: dict[str, Any], params: dict[str, int]) -> dict[str, Any]:
+    stability = result.get("stability")
+    if not isinstance(stability, dict) or set(stability) != {
+        "stable", "timed_out", "elapsed_ms", "samples", "stable_ms", "timeout_ms", "poll_ms",
+    }:
+        raise TransportError("SSH agent returned invalid stability metadata")
+    stable = stability["stable"]
+    timed_out = stability["timed_out"]
+    elapsed = stability["elapsed_ms"]
+    samples = stability["samples"]
+    if (
+        type(stable) is not bool or type(timed_out) is not bool or timed_out is stable
+        or type(elapsed) is not int or not 0 <= elapsed <= params["timeout_ms"]
+        or type(samples) is not int or not 1 <= samples <= 201
+        or any(type(stability[key]) is not int or stability[key] != params[key]
+               for key in ("stable_ms", "timeout_ms", "poll_ms"))
+        or stable and (samples < 2 or elapsed < params["stable_ms"])
+        or timed_out and elapsed != params["timeout_ms"]
+    ):
+        raise TransportError("SSH agent returned invalid stability metadata")
+    return stability
+
+
+def _validated_wait_frame(
+    result: dict[str, Any], params: dict[str, int],
+) -> tuple[list[TextContent | ImageContent], FrameView]:
+    content, view = _validated_frame(result, params)
+    stability = _validated_stability(result, params)
+    metadata = json.loads(content[0].text)
+    metadata["stability"] = stability
+    content[0] = TextContent(type="text", text=json.dumps(metadata, ensure_ascii=False))
+    return content, view
+
+
+def create_server(
+    host: str, *, transport: SSHTransport | None = None,
+    capture_max_width: int | None = None,
+) -> FastMCP:
     """Create the server; the SSH connection opens on the first tool call."""
+    default_capture = _capture_params(capture_max_width)
     connection = transport or SSHTransport(host)
     action_lock = asyncio.Lock()
     observation_required = False
@@ -324,7 +385,8 @@ def create_server(host: str, *, transport: SSHTransport | None = None) -> FastMC
         return mapped
 
     def action_and_frame(
-        method: str, params: dict[str, Any], view_id: str | None, deadline: float,
+        method: str, params: dict[str, Any], view_id: str | None,
+        capture_params: dict[str, int], deadline: float,
     ) -> tuple[list[TextContent | ImageContent], FrameView]:
         nonlocal observation_required, latest_view
         params = mapped_params(method, params, view_id)
@@ -353,7 +415,9 @@ def create_server(host: str, *, transport: SSHTransport | None = None) -> FastMC
                 "successful fresh desktop_screenshot before deciding whether to repeat it."
             )
         try:
-            return _validated_frame(connection.request("screenshot", deadline=deadline), {})
+            return _validated_frame(
+                connection.request("screenshot", capture_params, deadline=deadline), capture_params,
+            )
         except TransportError as exc:
             observation_required = True
             raise TransportError(
@@ -364,17 +428,29 @@ def create_server(host: str, *, transport: SSHTransport | None = None) -> FastMC
 
     async def input_and_frame(
         method: str, params: dict[str, Any], view_id: str | None = None,
+        capture_max_width: int | None = None,
     ) -> list[TextContent | ImageContent]:
-        return await serialized(lambda deadline: action_and_frame(method, params, view_id, deadline),
+        capture_params = (
+            default_capture if capture_max_width is None else _capture_params(capture_max_width)
+        )
+        return await serialized(lambda deadline: action_and_frame(method, params, view_id, capture_params, deadline),
                                 input_action=True, frame_result=True)
+
+    def status_with_recovery(method: str, deadline: float) -> str:
+        result = connection.request(method, deadline=deadline)
+        if not isinstance(result, dict) or {"observation_required", "recovery_action"} & result.keys():
+            raise TransportError("SSH agent returned conflicting status metadata")
+        return json.dumps({**result, "observation_required": observation_required,
+                           "recovery_action": "desktop_screenshot" if observation_required else None},
+                          ensure_ascii=False)
 
     @server.tool(description="Show connection and desktop dimensions for the authorized Raspberry Pi.", annotations=read_only)
     async def desktop_status() -> str:
-        return await serialized(lambda deadline: json.dumps(connection.request("status", deadline=deadline), ensure_ascii=False))
+        return await serialized(lambda deadline: status_with_recovery("status", deadline))
 
     @server.tool(description="Check Pi agent and desktop prerequisites without acquiring a session. This does not reserve the desktop or guarantee a later capture.", annotations=read_only)
     async def desktop_health() -> str:
-        return await serialized(lambda deadline: json.dumps(connection.request("health", deadline=deadline), ensure_ascii=False))
+        return await serialized(lambda deadline: status_with_recovery("health", deadline))
 
     @server.tool(description="Capture the Pi desktop, optionally a source region in original pixels and/or a downscaled image. The returned view_id enables image-pixel mouse coordinates.", annotations=read_only, structured_output=False)
     async def desktop_screenshot(
@@ -388,6 +464,22 @@ def create_server(host: str, *, transport: SSHTransport | None = None) -> FastMC
             observation="x" not in params, frame_result=True,
         )
 
+    @server.tool(description="Observe sampled desktop pixels until unchanged for the requested duration, or sampling times out. Returns the last image and stability status; sampled equality does not prove the app is ready. A full desktop_screenshot is still required to recover from an uncertain input.", annotations=read_only, structured_output=False)
+    async def desktop_wait_for_stable(
+        x: StrictInt | None = None, y: StrictInt | None = None,
+        width: StrictInt | None = None, height: StrictInt | None = None,
+        max_width: StrictInt | None = None,
+        stable_ms: StrictInt = 300, timeout_ms: StrictInt = 5000,
+        poll_ms: StrictInt = 100,
+    ) -> list[TextContent | ImageContent]:
+        params = _wait_params(x, y, width, height, max_width, stable_ms, timeout_ms, poll_ms)
+        return await serialized(
+            lambda deadline: _validated_wait_frame(
+                connection.request("wait_for_stable", params, deadline=deadline), params,
+            ),
+            frame_result=True,
+        )
+
     @server.tool(description="Release this bridge's Pi desktop session. The MCP server can reconnect on the next tool call.", annotations=release_tool)
     async def desktop_disconnect() -> str:
         acknowledgement = await serialized(lambda deadline: connection.disconnect(deadline=deadline), invalidate_view=True)
@@ -396,32 +488,32 @@ def create_server(host: str, *, transport: SSHTransport | None = None) -> FastMC
         return "Desktop session released. A fresh screenshot is required before further input if an earlier action had an uncertain outcome."
 
     @server.tool(description="Move the pointer in original desktop pixels, or image pixels with the current view_id, then show a fresh screenshot.", annotations=input_tool, structured_output=False)
-    async def desktop_move(x: StrictInt, y: StrictInt, view_id: str | None = None) -> list[TextContent | ImageContent]:
-        return await input_and_frame("move", {"x": x, "y": y}, view_id)
+    async def desktop_move(x: StrictInt, y: StrictInt, view_id: str | None = None, capture_max_width: StrictInt | None = None) -> list[TextContent | ImageContent]:
+        return await input_and_frame("move", {"x": x, "y": y}, view_id, capture_max_width)
 
     @server.tool(description="Click in original desktop pixels, or image pixels with the current view_id, then show a fresh screenshot. Button is left, right, or middle.", annotations=input_tool, structured_output=False)
-    async def desktop_click(x: StrictInt, y: StrictInt, button: str = "left", count: StrictInt = 1, view_id: str | None = None) -> list[TextContent | ImageContent]:
-        return await input_and_frame("click", {"x": x, "y": y, "button": button, "count": count}, view_id)
+    async def desktop_click(x: StrictInt, y: StrictInt, button: str = "left", count: StrictInt = 1, view_id: str | None = None, capture_max_width: StrictInt | None = None) -> list[TextContent | ImageContent]:
+        return await input_and_frame("click", {"x": x, "y": y, "button": button, "count": count}, view_id, capture_max_width)
 
     @server.tool(description="Drag in original desktop pixels, or image pixels with the current view_id, then show a fresh screenshot.", annotations=input_tool, structured_output=False)
-    async def desktop_drag(start_x: StrictInt, start_y: StrictInt, end_x: StrictInt, end_y: StrictInt, view_id: str | None = None) -> list[TextContent | ImageContent]:
-        return await input_and_frame("drag", {"start_x": start_x, "start_y": start_y, "end_x": end_x, "end_y": end_y}, view_id)
+    async def desktop_drag(start_x: StrictInt, start_y: StrictInt, end_x: StrictInt, end_y: StrictInt, view_id: str | None = None, capture_max_width: StrictInt | None = None) -> list[TextContent | ImageContent]:
+        return await input_and_frame("drag", {"start_x": start_x, "start_y": start_y, "end_x": end_x, "end_y": end_y}, view_id, capture_max_width)
 
     @server.tool(description="Scroll at an explicit target in original pixels (x and y together), or image pixels with the current view_id, then show a fresh screenshot. Direction is up, down, left, or right.", annotations=input_tool, structured_output=False)
-    async def desktop_scroll(direction: str, ticks: StrictInt = 1, x: StrictInt | None = None, y: StrictInt | None = None, view_id: str | None = None) -> list[TextContent | ImageContent]:
+    async def desktop_scroll(direction: str, ticks: StrictInt = 1, x: StrictInt | None = None, y: StrictInt | None = None, view_id: str | None = None, capture_max_width: StrictInt | None = None) -> list[TextContent | ImageContent]:
         params: dict[str, Any] = {"direction": direction, "ticks": ticks}
         if x is not None:
             params["x"] = x
         if y is not None:
             params["y"] = y
-        return await input_and_frame("scroll", params, view_id)
+        return await input_and_frame("scroll", params, view_id, capture_max_width)
 
     @server.tool(name="desktop_type", description="Type text into the focused desktop app and show a fresh screenshot.", annotations=input_tool, structured_output=False)
-    async def desktop_type(text: str) -> list[TextContent | ImageContent]:
-        return await input_and_frame("type_text", {"text": text})
+    async def desktop_type(text: str, capture_max_width: StrictInt | None = None) -> list[TextContent | ImageContent]:
+        return await input_and_frame("type_text", {"text": text}, capture_max_width=capture_max_width)
 
     @server.tool(description="Press a key combination in the focused desktop app and show a fresh screenshot. Keys is a list such as ['Control_L','a'].", annotations=input_tool, structured_output=False)
-    async def desktop_key(keys: list[str]) -> list[TextContent | ImageContent]:
-        return await input_and_frame("key", {"keys": keys})
+    async def desktop_key(keys: list[str], capture_max_width: StrictInt | None = None) -> list[TextContent | ImageContent]:
+        return await input_and_frame("key", {"keys": keys}, capture_max_width=capture_max_width)
 
     return server

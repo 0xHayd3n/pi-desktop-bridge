@@ -127,6 +127,16 @@ def doctor(host: str) -> dict:
     return report
 
 
+def _capture_width(value: str) -> int:
+    try:
+        width = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("capture width must be an integer from 1 to 65535") from exc
+    if not 1 <= width <= 65_535:
+        raise argparse.ArgumentTypeError("capture width must be an integer from 1 to 65535")
+    return width
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Raspberry Pi desktop bridge over SSH")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -138,6 +148,9 @@ def _parser() -> argparse.ArgumentParser:
         )
         if name == "screenshot":
             sub.add_argument("--output", required=True, type=Path, help="PNG output path")
+        if name == "serve":
+            sub.add_argument("--capture-max-width", type=_capture_width,
+                             help="Maximum width of post-action images; explicit screenshots stay independent")
     return parser
 
 
@@ -154,7 +167,8 @@ def main(argv: list[str] | None = None) -> int:
             return 0 if report["ready"] else 1
         elif args.command == "serve":
             with SSHTransport(args.host) as transport:
-                create_server(args.host, transport=transport).run(transport="stdio")
+                create_server(args.host, transport=transport,
+                              capture_max_width=args.capture_max_width).run(transport="stdio")
         else:
             with SSHTransport(args.host) as transport:
                 if args.command == "status":

@@ -503,17 +503,17 @@ class ServingTests(unittest.TestCase):
         self.assertTrue(self.session.closed)
 
 
-class ProtocolV3Tests(unittest.TestCase):
+class ProtocolV4Tests(unittest.TestCase):
     setUp = InputTests.setUp
 
     def test_hello_is_lease_free_and_advertises_protocol_and_capabilities(self):
         with mock.patch.object(self.session, "ensure") as ensure, \
              mock.patch.object(agent.subprocess, "Popen") as spawn:
             result = self.desktop.dispatch("hello", {})
-        self.assertEqual(result["protocol_version"], 3)
-        self.assertEqual(result["agent_version"], "0.3.0")
+        self.assertEqual(result["protocol_version"], 4)
+        self.assertEqual(result["agent_version"], "0.4.0")
         self.assertRegex(result["agent_sha256"], r"^[0-9a-f]{64}$")
-        self.assertEqual(set(result["capabilities"]), {"hello", "health", "status", "screenshot", "move", "click", "drag", "scroll", "type_text", "key", "disconnect"})
+        self.assertEqual(set(result["capabilities"]), {"hello", "health", "status", "screenshot", "wait_for_stable", "move", "click", "drag", "scroll", "type_text", "key", "disconnect"})
         ensure.assert_not_called()
         spawn.assert_not_called()
 
@@ -694,7 +694,7 @@ class ProtocolV3Tests(unittest.TestCase):
         rejection, success = map(json.loads, output.getvalue().splitlines())
         self.assertEqual(set(rejection["error"]), {"code", "message", "input_state"})
         self.assertEqual(rejection["error"]["input_state"], "not_started")
-        self.assertEqual(success["result"]["protocol_version"], 3)
+        self.assertEqual(success["result"]["protocol_version"], 4)
 
 
 class LifecycleTests(unittest.TestCase):
@@ -1015,6 +1015,510 @@ class CompositorCaptureTests(unittest.TestCase):
         close.assert_called_once()
 
 
+class VisualStabilityTests(unittest.TestCase):
+    """Use actual PPM files and encoding; replace only clock and Pi processes."""
+
+    def setUp(self):
+        self.runtime = tempfile.TemporaryDirectory()
+        self.addCleanup(self.runtime.cleanup)
+        self.session = agent.OwnedWayVNC()
+        self.session.directory = Path(self.runtime.name)
+        self.session.environment = {"WAYLAND_DISPLAY": "/run/user/1000/wayland-0"}
+        self.session.output_name = "HDMI-A-1"
+        self.client = SimpleNamespace(width=4, height=2, close=mock.Mock(), pointer=mock.Mock())
+        self.session.client = self.client
+        self.geometry = {"name": "HDMI-A-1", "width": 4, "height": 2, "power": "ON", "captured": True}
+        self.session.output_geometry = self.geometry.copy()
+        self.desktop = agent.DesktopAgent(self.session)
+        self.now = 0.0
+        self.capture_seconds = 0.01
+        self.samples = [self.ppm(1)]
+        self.captures = []
+        self.files = []
+        self.processes = []
+        self.wait_timeouts = []
+        self.query_deadlines = []
+        self.wait_failure = None
+        temporary_file = tempfile.TemporaryFile
+
+        def private_file(*args, **kwargs):
+            output = temporary_file(*args, **kwargs)
+            self.files.append(output)
+            return output
+
+        patches = [
+            mock.patch.object(self.session, "ensure", return_value=self.client),
+            mock.patch.object(self.session, "is_active", return_value=True),
+            mock.patch.object(self.session, "_query_selected_output", side_effect=self.query),
+            mock.patch.object(agent.time, "monotonic", side_effect=lambda: self.now),
+            mock.patch.object(agent.time, "sleep", side_effect=self.advance),
+            mock.patch.object(agent.shutil, "which", return_value="/usr/bin/grim"),
+            mock.patch.object(agent.tempfile, "TemporaryFile", side_effect=private_file),
+            mock.patch.object(agent.subprocess, "Popen", side_effect=self.capture),
+        ]
+        for patch in patches:
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    @staticmethod
+    def ppm(value):
+        return b"P6\n4 2\n255\n" + bytes([value]) * 24
+
+    def advance(self, seconds):
+        self.now += seconds
+
+    def query(self, deadline=None, sampling=False):
+        self.query_deadlines.append(deadline)
+        return self.geometry.copy()
+
+    def capture(self, argv, **kwargs):
+        index = len(self.captures)
+        self.captures.append((self.now, argv, kwargs))
+        output = kwargs["stdout"]
+        self.assertEqual(output.tell(), 0)
+        self.assertEqual(os.fstat(output.fileno()).st_size, 0)
+        output.write(self.samples[min(index, len(self.samples) - 1)])
+        process = mock.Mock()
+        process.poll.return_value = 0
+
+        def wait(timeout):
+            self.wait_timeouts.append(timeout)
+            if self.wait_failure is not None:
+                failure, self.wait_failure = self.wait_failure, None
+                process.poll.return_value = None
+                raise failure
+            if timeout < self.capture_seconds:
+                self.advance(timeout)
+                process.poll.return_value = None
+                raise subprocess.TimeoutExpired("grim", timeout)
+            self.advance(self.capture_seconds)
+            process.poll.return_value = 0
+            return 0
+
+        process.wait.side_effect = wait
+        self.processes.append(process)
+        return process
+
+    def observe(self, **params):
+        return self.desktop.dispatch("wait_for_stable", params)
+
+    def assert_clean(self):
+        self.assertEqual(len(self.files), 2)
+        self.assertTrue(all(output.closed for output in self.files))
+        self.assertIsNone(self.session.capture_process)
+
+    def test_unchanged_pixels_return_stable_exact_sample_and_fresh_usable_token(self):
+        self.desktop.latest_frame_id = "a" * 32
+        result = self.observe()
+        stability = result["stability"]
+        self.assertEqual(stability, {"stable": True, "timed_out": False,
+                                     "elapsed_ms": 340, "samples": 4,
+                                     "stable_ms": 300, "timeout_ms": 5000, "poll_ms": 100})
+        self.assertEqual(decode_png(base64.b64decode(result["image_base64"])), (4, 2, bytes([1]) * 24))
+        self.assertEqual(result["region"], {"x": 0, "y": 0, "width": 4, "height": 2})
+        self.assertNotEqual(result["frame_id"], "a" * 32)
+        self.assertEqual(len(self.captures), 4)  # No unobserved final capture.
+        self.assertTrue(all(item[1] == ["/usr/bin/grim", "-c", "-t", "ppm", "-o", "HDMI-A-1", "-"]
+                            for item in self.captures))
+        self.assertTrue(all(deadline == 5.0 for deadline in self.query_deadlines))
+        self.assertEqual(self.wait_timeouts, [5.0, 4.89, 4.78, 4.67])
+        self.client.pointer.assert_not_called()
+        self.desktop.dispatch("move", {"x": 1, "y": 1, "frame_id": result["frame_id"]})
+        self.client.pointer.assert_called_once_with(1, 1, 0)
+        self.assert_clean()
+
+    def test_change_restarts_unchanged_duration_at_first_changed_sample(self):
+        self.samples = [self.ppm(1), self.ppm(2), self.ppm(2)]
+        result = self.observe(stable_ms=200, poll_ms=100)
+        self.assertTrue(result["stability"]["stable"])
+        self.assertEqual(result["stability"]["samples"], 4)
+        self.assertGreaterEqual(result["stability"]["elapsed_ms"], 330)
+        self.assertEqual(decode_png(base64.b64decode(result["image_base64"]))[2], bytes([2]) * 24)
+        self.assert_clean()
+
+    def test_animation_times_out_with_latest_sample_and_no_capture_after_deadline(self):
+        self.samples = [self.ppm(index) for index in range(8)]
+        result = self.observe(stable_ms=200, timeout_ms=350, poll_ms=100)
+        self.assertEqual(result["stability"], {"stable": False, "timed_out": True,
+                                             "elapsed_ms": 350, "samples": 4,
+                                             "stable_ms": 200, "timeout_ms": 350, "poll_ms": 100})
+        self.assertEqual(decode_png(base64.b64decode(result["image_base64"]))[2], bytes([3]) * 24)
+        for before, after in zip(self.captures, self.captures[1:]):
+            self.assertGreaterEqual(after[0] - before[0] + 1e-9, self.capture_seconds + 0.1)
+        self.assertTrue(all(item[0] < 0.35 for item in self.captures))
+        self.assert_clean()
+
+    def test_terminal_capture_deadline_returns_latest_valid_image_and_keeps_session(self):
+        self.capture_seconds = 0.09
+        self.samples = [self.ppm(1), self.ppm(2), self.ppm(3)[:-6]]
+        result = self.observe(stable_ms=200, timeout_ms=350, poll_ms=50)
+        self.assertEqual(result["stability"], {"stable": False, "timed_out": True,
+                                             "elapsed_ms": 350, "samples": 2,
+                                             "stable_ms": 200, "timeout_ms": 350, "poll_ms": 50})
+        self.assertEqual(decode_png(base64.b64decode(result["image_base64"]))[2], bytes([2]) * 24)
+        self.assertEqual(len(self.captures), 3)
+        self.assertAlmostEqual(self.wait_timeouts[2], 0.07)
+        self.processes[2].terminate.assert_called_once()
+        self.assertGreater(self.now, 0.35)  # Cleanup is outside sampling elapsed_ms.
+        self.client.close.assert_not_called()
+        self.client.pointer.assert_not_called()
+        self.desktop.dispatch("move", {"x": 1, "y": 1, "frame_id": result["frame_id"]})
+        self.client.pointer.assert_called_once_with(1, 1, 0)
+        self.assert_clean()
+
+    def test_terminal_capture_deadline_without_valid_sample_is_error(self):
+        self.capture_seconds = 0.2
+        with self.assertRaisesRegex(agent.AgentError, "timed out.*valid sample"):
+            self.observe(stable_ms=100, timeout_ms=100, poll_ms=50)
+        self.processes[0].terminate.assert_called_once()
+        self.client.close.assert_called_once()
+        self.assertIsNone(self.desktop.latest_frame_id)
+        self.assert_clean()
+
+    def test_early_helper_timeout_after_valid_sample_still_raises(self):
+        original = self.capture
+        def capture(*args, **kwargs):
+            process = original(*args, **kwargs)
+            if len(self.captures) == 2:
+                self.wait_failure = subprocess.TimeoutExpired("grim", 0.001)
+            return process
+
+        with mock.patch.object(agent.subprocess, "Popen", side_effect=capture):
+            with self.assertRaisesRegex(agent.AgentError, "timed out"):
+                self.observe(stable_ms=200, timeout_ms=350, poll_ms=50)
+        self.assertEqual(len(self.captures), 2)
+        self.client.close.assert_called_once()
+        self.assert_clean()
+
+    def geometry_deadline(self, query_number, *, early=False, during_connect=False):
+        wires = []
+        response = json.dumps({"id": 1, "code": 0, "data": [self.geometry]}).encode()
+        def socket_factory(*args):
+            wire = FragmentedSocket(response)
+            wire.connect = mock.Mock()
+            wires.append(wire)
+            if len(wires) == query_number:
+                if during_connect:
+                    wire.connect.side_effect = lambda path: setattr(self, "now", 0.35)
+                else:
+                    def expire(count):
+                        if not early:
+                            self.now = 0.35
+                        raise socket.timeout()
+                    wire.recv = expire
+            return wire
+
+        original_query = agent.OwnedWayVNC._query_selected_output.__get__(self.session)
+        with mock.patch.object(self.session, "_query_selected_output", side_effect=original_query), \
+             mock.patch.object(agent.socket, "AF_UNIX", 1, create=True), \
+             mock.patch.object(agent.socket, "socket", side_effect=socket_factory):
+            result = self.observe(stable_ms=200, timeout_ms=350, poll_ms=50)
+        self.assertTrue(all(wire.closed for wire in wires))
+        if during_connect:
+            self.assertEqual(wires[query_number - 1].sent, [])
+        return result
+
+    def test_terminal_pre_geometry_deadline_returns_previous_valid_image(self):
+        self.capture_seconds = 0.09
+        self.samples = [self.ppm(index) for index in (1, 2, 3)]
+        result = self.geometry_deadline(5)
+        self.assertEqual(result["stability"]["samples"], 2)
+        self.assertEqual(result["stability"]["elapsed_ms"], 350)
+        self.assertFalse(result["stability"]["stable"])
+        self.assertEqual(decode_png(base64.b64decode(result["image_base64"]))[2], bytes([2]) * 24)
+        self.assertEqual(len(self.captures), 2)
+        self.client.close.assert_not_called()
+        self.assert_clean()
+
+    def test_geometry_connect_consuming_deadline_stops_before_query_send(self):
+        self.samples = [self.ppm(index) for index in (1, 2, 3)]
+        result = self.geometry_deadline(3, during_connect=True)
+        self.assertEqual(result["stability"]["samples"], 1)
+        self.assertTrue(result["stability"]["timed_out"])
+        self.assertEqual(decode_png(base64.b64decode(result["image_base64"]))[2], bytes([1]) * 24)
+        self.assertEqual(len(self.captures), 1)
+        self.client.close.assert_not_called()
+        self.assert_clean()
+
+    def test_terminal_post_geometry_deadline_discards_unvalidated_candidate(self):
+        self.samples = [self.ppm(index) for index in (1, 2, 3)]
+        result = self.geometry_deadline(6)
+        self.assertEqual(result["stability"]["samples"], 2)
+        self.assertEqual(result["stability"]["elapsed_ms"], 350)
+        self.assertFalse(result["stability"]["stable"])
+        self.assertEqual(decode_png(base64.b64decode(result["image_base64"]))[2], bytes([2]) * 24)
+        self.assertEqual(len(self.captures), 3)
+        self.client.close.assert_not_called()
+        self.assert_clean()
+
+    def test_malformed_completed_candidate_is_not_hidden_by_post_geometry_expiry(self):
+        self.samples = [self.ppm(1), self.ppm(2)[:-6]]
+        with self.assertRaisesRegex(agent.AgentError, "pixel payload"):
+            self.geometry_deadline(4)
+        self.client.close.assert_called_once()
+        self.assert_clean()
+
+    def test_geometry_budget_expiry_without_valid_sample_is_error(self):
+        with self.assertRaisesRegex(agent.AgentError, "timed out.*valid sample"):
+            self.geometry_deadline(1)
+        self.assertEqual(len(self.captures), 0)
+        self.client.close.assert_called_once()
+        self.assert_clean()
+
+    def test_early_geometry_timeout_after_valid_sample_still_raises(self):
+        with self.assertRaisesRegex(agent.AgentError, "query timed out"):
+            self.geometry_deadline(3, early=True)
+        self.assertEqual(len(self.captures), 1)
+        self.client.close.assert_called_once()
+        self.assert_clean()
+
+    def test_geometry_mismatch_at_deadline_still_raises_after_valid_sample(self):
+        def query(deadline=None, sampling=False):
+            self.query_deadlines.append(deadline)
+            if len(self.query_deadlines) == 3:
+                self.now = deadline
+                return {**self.geometry, "width": 5}
+            return self.geometry.copy()
+
+        with mock.patch.object(self.session, "_query_selected_output", side_effect=query):
+            with self.assertRaises(agent.AgentError) as error:
+                self.observe(stable_ms=200, timeout_ms=350, poll_ms=50)
+        self.assertEqual(error.exception.code, "geometry_changed")
+        self.client.close.assert_called_once()
+        self.assert_clean()
+
+    def test_nonzero_helper_at_deadline_still_raises_after_valid_sample(self):
+        original = self.capture
+        def capture(*args, **kwargs):
+            process = original(*args, **kwargs)
+            if len(self.captures) == 2:
+                def fail(timeout):
+                    self.advance(timeout)
+                    return 1
+                process.wait.side_effect = fail
+            return process
+
+        with mock.patch.object(agent.subprocess, "Popen", side_effect=capture):
+            with self.assertRaisesRegex(agent.AgentError, "could not capture"):
+                self.observe(stable_ms=200, timeout_ms=350, poll_ms=50)
+        self.client.close.assert_called_once()
+        self.assert_clean()
+
+    def test_native_roi_detects_changes_hidden_by_returned_resize(self):
+        # A 4-to-1 resize selects x=2,y=1, so changing x=0 is invisible in PNG.
+        self.samples = [self.ppm(1)[:-24] + bytes([index]) * 3 + bytes([1]) * 21 for index in range(8)]
+        result = self.observe(max_width=1, stable_ms=200, timeout_ms=350, poll_ms=100)
+        self.assertFalse(result["stability"]["stable"])
+        self.assertEqual(decode_png(base64.b64decode(result["image_base64"])), (1, 1, bytes([1]) * 3))
+        self.assert_clean()
+
+    def test_every_native_roi_row_is_monitored(self):
+        # Bottom-right pixel is inside ROI but not selected in a 4-to-1 image.
+        self.samples = [self.ppm(1)[:-3] + bytes([index]) * 3 for index in range(8)]
+        result = self.observe(max_width=1, stable_ms=200, timeout_ms=350, poll_ms=100)
+        self.assertFalse(result["stability"]["stable"])
+        self.assertEqual(decode_png(base64.b64decode(result["image_base64"])), (1, 1, bytes([1]) * 3))
+
+    def test_ppm_header_variation_does_not_count_as_pixel_change(self):
+        self.samples = [self.ppm(1), b"P6\n# same RGB\n4 2\n255\n" + bytes([1]) * 24]
+        result = self.observe(stable_ms=200, poll_ms=100)
+        self.assertTrue(result["stability"]["stable"])
+        self.assertEqual(result["stability"]["samples"], 3)
+
+    def test_one_valid_sample_can_time_out_but_cannot_be_stable(self):
+        result = self.observe(stable_ms=100, timeout_ms=100, poll_ms=100)
+        self.assertEqual(result["stability"]["samples"], 1)
+        self.assertEqual(result["stability"]["elapsed_ms"], 100)
+        self.assertFalse(result["stability"]["stable"])
+        self.assertEqual(decode_png(base64.b64decode(result["image_base64"]))[2], bytes([1]) * 24)
+
+    def test_maximum_timeout_minimum_poll_remains_bounded(self):
+        self.capture_seconds = 0
+        self.samples = [self.ppm(index % 256) for index in range(202)]
+        result = self.observe(stable_ms=2000, timeout_ms=10000, poll_ms=50)
+        self.assertFalse(result["stability"]["stable"])
+        self.assertLessEqual(result["stability"]["samples"], 201)
+        self.assertEqual(result["stability"]["elapsed_ms"], 10000)
+        self.assert_clean()
+
+    def test_pixels_outside_roi_do_not_reset_stability_and_return_exact_roi(self):
+        self.samples = [self.ppm(1)[:-24] + bytes([index]) * 3 + bytes([1]) * 21 for index in range(8)]
+        result = self.observe(x=1, y=0, width=3, height=2, max_width=2,
+                              stable_ms=200, timeout_ms=350, poll_ms=100)
+        self.assertTrue(result["stability"]["stable"])
+        self.assertEqual(result["region"], {"x": 1, "y": 0, "width": 3, "height": 2})
+        self.assertEqual(decode_png(base64.b64decode(result["image_base64"])), (2, 1, bytes([1]) * 6))
+        self.assert_clean()
+
+    def test_startup_and_final_encoding_are_outside_sampling_elapsed_time(self):
+        def ensure():
+            self.advance(7)
+            return self.client
+
+        encode = agent._ppm_png
+        def slow_encode(*args):
+            self.advance(2)
+            return encode(*args)
+
+        with mock.patch.object(self.session, "ensure", side_effect=ensure), \
+             mock.patch.object(agent, "_ppm_png", side_effect=slow_encode):
+            result = self.observe()
+        self.assertEqual(result["stability"]["elapsed_ms"], 340)
+        self.assertTrue(all(deadline == 12 for deadline in self.query_deadlines))
+        self.assertAlmostEqual(self.now, 9.34)
+        self.assert_clean()
+
+    def test_capture_timeout_is_error_with_cleanup_and_invalidates_previous_token(self):
+        self.desktop.latest_frame_id = "a" * 32
+        self.wait_failure = subprocess.TimeoutExpired("grim", 0.2)
+        with self.assertRaisesRegex(agent.AgentError, "timed out") as error:
+            self.observe(stable_ms=100, timeout_ms=200, poll_ms=50)
+        self.assertEqual(error.exception.input_state, "not_started")
+        self.processes[0].terminate.assert_called_once()
+        self.assertIsNone(self.desktop.latest_frame_id)
+        self.assert_clean()
+
+    def test_unresponsive_capture_is_killed_after_bounded_terminate_wait(self):
+        original = self.capture
+        def capture(*args, **kwargs):
+            process = original(*args, **kwargs)
+            process.poll.return_value = None
+            process.wait.side_effect = [subprocess.TimeoutExpired("grim", 0.2),
+                                        subprocess.TimeoutExpired("grim", 2), 0]
+            return process
+
+        with mock.patch.object(agent.subprocess, "Popen", side_effect=capture):
+            with self.assertRaisesRegex(agent.AgentError, "timed out"):
+                self.observe(stable_ms=100, timeout_ms=200, poll_ms=50)
+        self.processes[0].terminate.assert_called_once()
+        self.processes[0].kill.assert_called_once()
+        self.assertEqual(self.processes[0].wait.call_args_list,
+                         [mock.call(timeout=0.2), mock.call(timeout=2), mock.call(timeout=2)])
+        self.assert_clean()
+
+    def test_capture_child_gets_hard_file_limit_without_changing_parent(self):
+        resource = mock.Mock(RLIMIT_FSIZE=1)
+        with mock.patch.object(agent, "resource", resource, create=True):
+            self.observe()
+            resource.setrlimit.assert_not_called()
+            callback = self.captures[0][2]["preexec_fn"]
+            callback()
+        resource.setrlimit.assert_called_once_with(1, (agent.MAX_PPM_BYTES, agent.MAX_PPM_BYTES))
+
+    def test_failed_capture_or_limit_setup_is_error_and_cleans_file(self):
+        for failure in (OSError("cannot execute"), subprocess.SubprocessError("preexec failed")):
+            with self.subTest(failure=failure):
+                with mock.patch.object(agent.subprocess, "Popen", side_effect=failure):
+                    with self.assertRaisesRegex(agent.AgentError, "capture failed") as error:
+                        self.session.wait_for_stable((0, 0, 4, 2), None, 100, 200, 50)
+                self.assertEqual(error.exception.input_state, "not_started")
+                self.assertTrue(self.files[-1].closed)
+                self.assertIsNone(self.session.capture_process)
+
+    def test_capture_receives_budget_remaining_after_geometry_query(self):
+        def query(deadline=None, sampling=False):
+            self.advance(0.02)
+            self.query_deadlines.append(deadline)
+            return self.geometry.copy()
+
+        with mock.patch.object(self.session, "_query_selected_output", side_effect=query):
+            self.observe(stable_ms=100, timeout_ms=500, poll_ms=100)
+        self.assertEqual(self.query_deadlines, [0.5] * 4)
+        self.assertAlmostEqual(self.wait_timeouts[0], 0.48)
+        self.assertAlmostEqual(self.wait_timeouts[1], 0.33)
+
+    def test_deadline_exhausted_by_preflight_does_not_start_capture(self):
+        def query(deadline=None, sampling=False):
+            self.advance(0.1)
+            return self.geometry.copy()
+
+        with mock.patch.object(self.session, "_query_selected_output", side_effect=query):
+            with self.assertRaisesRegex(agent.AgentError, "timed out"):
+                self.observe(stable_ms=100, timeout_ms=100, poll_ms=100)
+        self.assertEqual(self.captures, [])
+        self.assert_clean()
+
+    def test_geometry_query_error_after_valid_sample_never_claims_stable(self):
+        with mock.patch.object(self.session, "_query_selected_output", side_effect=[
+                self.geometry, self.geometry, agent.AgentError("query timed out")]):
+            with self.assertRaisesRegex(agent.AgentError, "query timed out") as error:
+                self.observe()
+        self.assertEqual(error.exception.code, "preflight_failed")
+        self.assertEqual(len(self.captures), 1)
+        self.assert_clean()
+
+    def test_oversized_ppm_fails_before_pixel_read(self):
+        with mock.patch.object(agent, "MAX_PPM_BYTES", len(self.ppm(1)) - 1):
+            with self.assertRaisesRegex(agent.AgentError, "byte limit"):
+                self.observe()
+        self.assert_clean()
+
+    def test_nonzero_helper_exit_never_returns_an_observation(self):
+        original = self.capture
+        def capture(*args, **kwargs):
+            process = original(*args, **kwargs)
+            process.wait.side_effect = None
+            process.wait.return_value = 1
+            return process
+
+        with mock.patch.object(agent.subprocess, "Popen", side_effect=capture):
+            with self.assertRaisesRegex(agent.AgentError, "could not capture"):
+                self.observe()
+        self.assert_clean()
+
+    def test_malformed_ppm_fails_instead_of_reporting_timeout_or_stable(self):
+        valid = self.ppm(1)
+        for invalid in (valid[:-1], valid + b"\0", valid.replace(b"4 2", b"2 4"), b"bad",
+                        b"P6\n4 2\n255\n" + bytes(25)):
+            with self.subTest(invalid=invalid[:16]):
+                self.samples = [invalid]
+                # Call session directly so failed sample validation retains fixture setup.
+                with self.assertRaises(agent.AgentError):
+                    self.session.wait_for_stable((0, 0, 4, 2), None, 100, 200, 50)
+                self.assertTrue(self.files[-1].closed)
+                self.assertIsNone(self.session.capture_process)
+
+    def test_geometry_change_during_capture_raises_and_closes_session(self):
+        def wait(timeout):
+            self.advance(0.01)
+            self.geometry["width"] = 5
+            return 0
+
+        original = self.capture
+        def capture(*args, **kwargs):
+            process = original(*args, **kwargs)
+            process.wait.side_effect = wait
+            return process
+
+        with mock.patch.object(agent.subprocess, "Popen", side_effect=capture):
+            with self.assertRaises(agent.AgentError) as error:
+                self.observe()
+        self.assertEqual(error.exception.code, "geometry_changed")
+        self.client.close.assert_called_once()
+        self.assert_clean()
+
+    def test_invalid_wait_params_reject_before_ensure_or_capture(self):
+        cases = ({"stable_ms": 49}, {"stable_ms": 2001}, {"stable_ms": True}, {"stable_ms": 1.5},
+                 {"timeout_ms": 99}, {"timeout_ms": 10001}, {"timeout_ms": None},
+                 {"poll_ms": 49}, {"poll_ms": 1001}, {"poll_ms": "100"},
+                 {"poll_ms": 301}, {"stable_ms": 400, "timeout_ms": 300},
+                 {"x": 0}, {"max_width": 0}, {"max_width": True}, {"extra": 1})
+        with mock.patch.object(self.session, "ensure") as ensure:
+            for params in cases:
+                with self.subTest(params=params):
+                    with self.assertRaises(agent.AgentError) as error:
+                        self.observe(**params)
+                    self.assertEqual(error.exception.code, "invalid_params")
+            ensure.assert_not_called()
+        self.assertEqual(self.captures, [])
+
+    def test_out_of_bounds_roi_rejects_after_ensure_before_capture(self):
+        with self.assertRaises(agent.AgentError) as error:
+            self.observe(x=3, y=1, width=2, height=1)
+        self.assertEqual(error.exception.code, "invalid_params")
+        self.assertEqual(self.captures, [])
+
+
 class LeaseTests(unittest.TestCase):
     def setUp(self):
         self.flock = mock.Mock(LOCK_EX=2, LOCK_NB=4)
@@ -1067,6 +1571,27 @@ class LeaseTests(unittest.TestCase):
         with self.assertRaisesRegex(agent.AgentError, "already controlled"):
             agent.DesktopLease("/run/user/1000")
         agent.os.close.assert_called_once_with(42)
+
+
+@unittest.skipUnless(sys.platform.startswith("linux"), "requires real Linux resource limits")
+class LinuxCaptureLimitTests(unittest.TestCase):
+    def test_capture_child_cannot_grow_sample_file_past_limit(self):
+        parent_limit = agent.resource.getrlimit(agent.resource.RLIMIT_FSIZE)
+        with tempfile.TemporaryFile() as output, mock.patch.object(agent, "MAX_PPM_BYTES", 1024):
+            process = subprocess.Popen(
+                [sys.executable, "-c", "import os; [os.write(1, b'x'*512) for _ in range(10)]"],
+                stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.DEVNULL,
+                preexec_fn=agent._limit_capture_file,
+            )
+            try:
+                self.assertNotEqual(process.wait(timeout=5), 0)
+                self.assertEqual(os.fstat(output.fileno()).st_size, 1024)
+                self.assertEqual(stat.S_IMODE(os.fstat(output.fileno()).st_mode), 0o600)
+                self.assertEqual(agent.resource.getrlimit(agent.resource.RLIMIT_FSIZE), parent_limit)
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                    process.wait(timeout=5)
 
 
 @unittest.skipUnless(sys.platform.startswith("linux"), "requires real Linux flock")
