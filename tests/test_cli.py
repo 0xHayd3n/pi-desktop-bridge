@@ -13,7 +13,7 @@ from pi_desktop_bridge.transport import TransportError
 
 def healthy():
     return {
-        "protocol_version": 2, "agent_version": "0.2.0",
+        "protocol_version": cli.PROTOCOL_VERSION, "agent_version": cli.__version__,
         "agent_sha256": hashlib.sha256(Path(cli.__file__).with_name("pi_agent.py").read_bytes()).hexdigest(),
         "desktop_ready": True, "session_active": False,
         "checks": [{"name": "wayland", "ok": True, "message": "Desktop socket found"}],

@@ -183,7 +183,9 @@ class Session:
         self.closed = True
         self.client.close()
 
-    def screenshot_png(self):
+    def screenshot_png(self, region=None, max_width=None):
+        if region is not None or max_width is not None:
+            raise AssertionError("Patch transformed capture in tests")
         return self.client.screenshot_png()
 
 
@@ -359,6 +361,110 @@ class InputTests(unittest.TestCase):
         result = self.desktop.dispatch("screenshot", {})
         self.assertEqual(result["mime_type"], "image/png")
         self.assertEqual(decode_png(base64.b64decode(result["image_base64"]))[:2], (100, 80))
+        self.assertEqual((result["width"], result["height"], result["desktop_width"], result["desktop_height"]),
+                         (100, 80, 100, 80))
+        self.assertEqual(result["region"], {"x": 0, "y": 0, "width": 100, "height": 80})
+        self.assertRegex(result["frame_id"], r"^[0-9a-f]{32}$")
+
+    def test_region_and_resized_overview_metadata_and_fresh_tokens(self):
+        cropped = agent._png_rgb_rows(3, 2, [b"\x22" * 9, b"\x33" * 9])
+        overview = agent._png_rgb_rows(25, 20, [b"\x44" * 75 for _ in range(20)])
+        with mock.patch.object(self.session, "screenshot_png", side_effect=[cropped, overview]) as capture:
+            first = self.desktop.dispatch("screenshot", {"x": 10, "y": 20, "width": 9, "height": 6,
+                                                         "max_width": 3})
+            second = self.desktop.dispatch("screenshot", {"max_width": 25})
+        self.assertEqual(capture.call_args_list, [mock.call((10, 20, 9, 6), 3),
+                                                  mock.call((0, 0, 100, 80), 25)])
+        self.assertEqual((first["width"], first["height"]), (3, 2))
+        self.assertEqual(first["region"], {"x": 10, "y": 20, "width": 9, "height": 6})
+        self.assertEqual((second["width"], second["height"]), (25, 20))
+        self.assertEqual(second["region"], {"x": 0, "y": 0, "width": 100, "height": 80})
+        self.assertNotEqual(first["frame_id"], second["frame_id"])
+
+    def test_invalid_capture_shape_rejects_before_ensure_and_bounds_after_ensure(self):
+        for params in ({"x": 0}, {"x": 0, "y": 0, "width": 1},
+                       {"x": True, "y": 0, "width": 1, "height": 1},
+                       {"x": 0, "y": 0, "width": 0, "height": 1},
+                       {"x": 0, "y": 0, "width": 5000, "height": 5000},
+                       {"max_width": 0}, {"max_width": 1.5}, {"max_width": True}):
+            with self.subTest(params=params), mock.patch.object(self.session, "ensure") as ensure:
+                with self.assertRaises(agent.AgentError) as error:
+                    self.desktop.dispatch("screenshot", params)
+                self.assertEqual(error.exception.code, "invalid_params")
+                ensure.assert_not_called()
+        with mock.patch.object(self.session, "screenshot_png") as capture:
+            with self.assertRaises(agent.AgentError) as error:
+                self.desktop.dispatch("screenshot", {"x": 99, "y": 0, "width": 2, "height": 1})
+        self.assertEqual(error.exception.code, "invalid_params")
+        capture.assert_not_called()
+        self.assertFalse(self.session.closed)
+
+    def test_latest_frame_token_rejects_stale_and_is_consumed_by_input(self):
+        png = agent._png(100, 80, bytes(100 * 80 * 4))
+        with mock.patch.object(self.session, "screenshot_png", return_value=png):
+            first = self.desktop.dispatch("screenshot", {})["frame_id"]
+            current = self.desktop.dispatch("screenshot", {})["frame_id"]
+        with self.assertRaises(agent.AgentError) as stale:
+            self.desktop.dispatch("move", {"x": 2, "y": 3, "frame_id": first})
+        self.assertEqual((stale.exception.code, stale.exception.input_state), ("stale_view", "not_started"))
+        self.assertEqual(self.wire.sent, [])
+        self.assertFalse(self.session.closed)
+        self.assertEqual(self.desktop.dispatch("move", {"x": 2, "y": 3, "frame_id": current}), {"ok": True})
+        self.assertEqual(self.wire.sent, [self.pointer(2, 3)])
+        with self.assertRaises(agent.AgentError) as consumed:
+            self.desktop.dispatch("move", {"x": 4, "y": 5, "frame_id": current})
+        self.assertEqual((consumed.exception.code, consumed.exception.input_state), ("stale_view", "not_started"))
+        self.assertEqual(self.wire.sent, [self.pointer(2, 3)])
+
+    def test_token_before_capture_and_failed_capture_send_no_input(self):
+        unknown = "a" * 32
+        with self.assertRaises(agent.AgentError) as absent:
+            self.desktop.dispatch("move", {"x": 1, "y": 1, "frame_id": unknown})
+        self.assertEqual((absent.exception.code, absent.exception.input_state), ("stale_view", "not_started"))
+        self.assertFalse(self.session.closed)
+        self.assertEqual(self.wire.sent, [])
+        png = agent._png(100, 80, bytes(100 * 80 * 4))
+        with mock.patch.object(self.session, "screenshot_png", return_value=png):
+            frame_id = self.desktop.dispatch("screenshot", {})["frame_id"]
+        with mock.patch.object(self.session, "screenshot_png", side_effect=agent.AgentError("capture failed")):
+            with self.assertRaises(agent.AgentError):
+                self.desktop.dispatch("screenshot", {})
+        self.assertTrue(self.session.closed)
+        self.assertIsNone(self.desktop.latest_frame_id)
+        self.assertNotEqual(frame_id, self.desktop.latest_frame_id)
+
+    def test_known_rejections_preserve_token_but_native_keyboard_consumes_it(self):
+        png = agent._png(100, 80, bytes(100 * 80 * 4))
+        with mock.patch.object(self.session, "screenshot_png", return_value=png):
+            frame_id = self.desktop.dispatch("screenshot", {})["frame_id"]
+        for params in ({"x": -1, "y": 0, "frame_id": frame_id},
+                       {"x": 101, "y": 0, "frame_id": frame_id},
+                       {"x": 1, "y": 1, "frame_id": "F" * 32}):
+            with self.subTest(params=params):
+                with self.assertRaises(agent.AgentError) as error:
+                    self.desktop.dispatch("move", params)
+                self.assertEqual(error.exception.code, "invalid_params")
+                self.assertEqual(self.wire.sent, [])
+        self.desktop.dispatch("status", {})
+        self.desktop.dispatch("key", {"keys": ["a"]})
+        with self.assertRaises(agent.AgentError) as stale:
+            self.desktop.dispatch("move", {"x": 1, "y": 1, "frame_id": frame_id})
+        self.assertEqual(stale.exception.code, "stale_view")
+        self.assertEqual(self.wire.sent, [self.key(97, True), self.key(97, False)])
+
+    def test_frame_token_cannot_cross_reconnected_client(self):
+        png = agent._png(100, 80, bytes(100 * 80 * 4))
+        with mock.patch.object(self.session, "screenshot_png", return_value=png):
+            frame_id = self.desktop.dispatch("screenshot", {})["frame_id"]
+        fresh_wire = FragmentedSocket()
+        fresh_client = agent.RFBClient(fresh_wire)
+        fresh_client.width, fresh_client.height = 100, 80
+        self.session.client = fresh_client
+        with self.assertRaises(agent.AgentError) as stale:
+            self.desktop.dispatch("move", {"x": 1, "y": 1, "frame_id": frame_id})
+        self.assertEqual((stale.exception.code, stale.exception.input_state), ("stale_view", "not_started"))
+        self.assertEqual(fresh_wire.sent, [])
+        self.assertTrue(fresh_wire.closed)
 
     def test_screenshot_uses_fresh_compositor_capture_instead_of_rfb_placeholder(self):
         self.wire.incoming.extend(update(rectangle(0, 0, 100, 80, b"\x60\x60\x60\0" * 8000)))
@@ -397,15 +503,15 @@ class ServingTests(unittest.TestCase):
         self.assertTrue(self.session.closed)
 
 
-class ProtocolV2Tests(unittest.TestCase):
+class ProtocolV3Tests(unittest.TestCase):
     setUp = InputTests.setUp
 
     def test_hello_is_lease_free_and_advertises_protocol_and_capabilities(self):
         with mock.patch.object(self.session, "ensure") as ensure, \
              mock.patch.object(agent.subprocess, "Popen") as spawn:
             result = self.desktop.dispatch("hello", {})
-        self.assertEqual(result["protocol_version"], 2)
-        self.assertEqual(result["agent_version"], "0.2.0")
+        self.assertEqual(result["protocol_version"], 3)
+        self.assertEqual(result["agent_version"], "0.3.0")
         self.assertRegex(result["agent_sha256"], r"^[0-9a-f]{64}$")
         self.assertEqual(set(result["capabilities"]), {"hello", "health", "status", "screenshot", "move", "click", "drag", "scroll", "type_text", "key", "disconnect"})
         ensure.assert_not_called()
@@ -588,7 +694,7 @@ class ProtocolV2Tests(unittest.TestCase):
         rejection, success = map(json.loads, output.getvalue().splitlines())
         self.assertEqual(set(rejection["error"]), {"code", "message", "input_state"})
         self.assertEqual(rejection["error"]["input_state"], "not_started")
-        self.assertEqual(success["result"]["protocol_version"], 2)
+        self.assertEqual(success["result"]["protocol_version"], 3)
 
 
 class LifecycleTests(unittest.TestCase):
@@ -704,9 +810,10 @@ class CompositorCaptureTests(unittest.TestCase):
         self.session.environment = {"WAYLAND_DISPLAY": "/run/user/1000/wayland-0"}
         self.session.output_name = "HDMI-A-1"
         self.session.client = SimpleNamespace(width=2, height=1)
+        self.capture_geometry = mock.Mock()
         self.png = agent._png(2, 1, b"\0\0\xff\0\xff\0\0\0")
 
-    def capture_with_output(self, png, process=None):
+    def capture_with_output(self, png, process=None, region=None, max_width=None):
         process = process or mock.Mock()
         process.poll.return_value = 0
         process.wait.return_value = 0
@@ -714,8 +821,9 @@ class CompositorCaptureTests(unittest.TestCase):
             kwargs["stdout"].write(png)
             return process
         with mock.patch.object(agent.shutil, "which", return_value="/usr/bin/grim"), \
-             mock.patch.object(agent.subprocess, "Popen", side_effect=start) as spawn:
-            result = self.session.screenshot_png()
+             mock.patch.object(agent.subprocess, "Popen", side_effect=start) as spawn, \
+             mock.patch.object(self.session, "check_geometry", self.capture_geometry):
+            result = self.session.screenshot_png(region, max_width)
         return result, spawn, process
 
     def test_capture_selects_same_output_and_preserves_exact_pixels(self):
@@ -725,6 +833,57 @@ class CompositorCaptureTests(unittest.TestCase):
         self.assertEqual(spawn.call_args.kwargs["env"], self.session.environment)
         self.assertEqual(spawn.call_args.kwargs["stdin"], subprocess.DEVNULL)
         self.assertEqual(process.wait.call_args.kwargs["timeout"], agent.IO_TIMEOUT)
+        self.assertEqual(self.capture_geometry.call_count, 2)
+
+    def test_ppm_crop_preserves_exact_edge_pixels_without_native_geometry_flags(self):
+        self.session.client = SimpleNamespace(width=4, height=3)
+        rgb = bytes(channel for y in range(3) for x in range(4)
+                    for channel in (x + 10 * y, 100 + x, 200 + y))
+        ppm = b"P6\n4 3\n255\n" + rgb
+        actual, spawn, _ = self.capture_with_output(ppm, region=(1, 1, 3, 2))
+        expected = bytes(channel for y in (1, 2) for x in (1, 2, 3)
+                         for channel in (x + 10 * y, 100 + x, 200 + y))
+        self.assertEqual(decode_png(actual), (3, 2, expected))
+        self.assertEqual(spawn.call_args.args[0], ["/usr/bin/grim", "-c", "-t", "ppm", "-o", "HDMI-A-1", "-"])
+        self.assertEqual(self.capture_geometry.call_count, 2)
+
+    def test_ppm_nearest_neighbor_samples_pixel_centers_for_noninteger_ratio(self):
+        self.session.client = SimpleNamespace(width=5, height=4)
+        rgb = bytes(channel for y in range(4) for x in range(5)
+                    for channel in (x, y, x + 5 * y))
+        actual, _, _ = self.capture_with_output(b"P6\n5 4\n255\n" + rgb,
+                                                region=(0, 0, 5, 4), max_width=3)
+        expected = bytes(channel for y in (1, 3) for x in (0, 2, 4)
+                         for channel in (x, y, x + 5 * y))
+        self.assertEqual(decode_png(actual), (3, 2, expected))
+
+    def test_ppm_rejects_malformed_size_and_dimension_payloads(self):
+        good = b"P6\n2 1\n255\n" + b"\x01\x02\x03\x04\x05\x06"
+        cases = (b"P3\n2 1\n255\n" + good[-6:],
+                 b"P6\n2 1\n65535\n" + good[-6:],
+                 b"P6\n1 1\n255\n" + good[-6:],
+                 good[:-1], good + b"\0",
+                 b"P6\n" + b" " * 257 + b"2 1\n255\n" + good[-6:])
+        for ppm in cases:
+            with self.subTest(ppm=ppm[:25]):
+                with self.assertRaises(agent.AgentError):
+                    self.capture_with_output(ppm, region=(0, 0, 2, 1))
+        with mock.patch.object(agent, "MAX_PPM_BYTES", len(good) - 1):
+            with self.assertRaisesRegex(agent.AgentError, "byte limit"):
+                self.capture_with_output(good, region=(0, 0, 2, 1))
+
+    def test_geometry_is_checked_before_and_after_both_capture_paths(self):
+        for region in (None, (0, 0, 2, 1)):
+            with self.subTest(region=region):
+                self.capture_geometry.reset_mock()
+                data = self.png if region is None else b"P6\n2 1\n255\n" + b"\xff\0\0\0\0\xff"
+                changed = agent.AgentError("output changed", code="geometry_changed")
+                self.capture_geometry.side_effect = [None, changed]
+                with self.assertRaises(agent.AgentError) as error:
+                    self.capture_with_output(data, region=region)
+                self.assertEqual(error.exception.code, "geometry_changed")
+                self.assertEqual(self.capture_geometry.call_count, 2)
+                self.capture_geometry.side_effect = None
 
     def test_valid_solid_gray_compositor_image_is_accepted(self):
         gray = agent._png(2, 1, b"\x60\x60\x60\0" * 2)
@@ -749,7 +908,8 @@ class CompositorCaptureTests(unittest.TestCase):
         process.poll.return_value = None
         process.wait.side_effect = [subprocess.TimeoutExpired("grim", 10), 0]
         with mock.patch.object(agent.shutil, "which", return_value="grim"), \
-             mock.patch.object(agent.subprocess, "Popen", return_value=process):
+             mock.patch.object(agent.subprocess, "Popen", return_value=process), \
+             mock.patch.object(self.session, "check_geometry", self.capture_geometry):
             with self.assertRaisesRegex(agent.AgentError, "timed out"):
                 self.session.screenshot_png()
         process.terminate.assert_called_once()

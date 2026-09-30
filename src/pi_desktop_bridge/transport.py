@@ -279,7 +279,7 @@ class SSHTransport:
         except (TransportError, OSError) as exc:
             self._discard()
             raise TransportError(
-                "Could not negotiate Pi desktop protocol 2. Deploy the latest agent and reconnect.",
+                f"Could not negotiate Pi desktop protocol {PROTOCOL_VERSION}. Deploy the latest agent and reconnect.",
                 code="incompatible_agent", input_state="not_started",
             ) from exc
 

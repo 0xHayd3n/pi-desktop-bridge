@@ -145,7 +145,7 @@ async def exercise(host, output):
                         return transport.request("status")
 
                 health = json_content(await call("desktop_health"))
-                assert health["desktop_ready"] and health["protocol_version"] == 2, health
+                assert health["desktop_ready"] and health["protocol_version"] == 3, health
                 assert health["session_active"] is False, health
                 report["checks"]["lease_free_health"] = True
                 rejected = await session.call_tool("desktop_click", {"x": 0, "y": 0, "button": "invalid"})

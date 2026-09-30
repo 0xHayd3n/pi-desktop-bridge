@@ -9,6 +9,8 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
+import secrets
 import shutil
 import signal
 import socket
@@ -31,8 +33,10 @@ MAX_TEXT_BYTES = 1_048_576
 IO_TIMEOUT = 10.0
 MAX_REQUEST_BYTES = 65_536
 MAX_PNG_BYTES = MAX_PIXELS * 4 + MAX_TEXT_BYTES
-PROTOCOL_VERSION = 2
-AGENT_VERSION = "0.2.0"
+MAX_PPM_HEADER = 256
+MAX_PPM_BYTES = MAX_PIXELS * 3 + MAX_PPM_HEADER
+PROTOCOL_VERSION = 3
+AGENT_VERSION = "0.3.0"
 # Identify the source that this process loaded, even if deployment replaces it.
 AGENT_SHA256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
 
@@ -70,6 +74,110 @@ def _png(width, height, bgrx):
     return (b"\x89PNG\r\n\x1a\n"
             + chunk(b"IHDR", struct.pack("!IIBBBBB", width, height, 8, 2, 0, 0, 0))
             + chunk(b"IDAT", bytes(compressed)) + chunk(b"IEND", b""))
+
+
+def _png_rgb_rows(width, height, rows):
+    """Encode a bounded sequence of RGB rows without loading the PPM raster."""
+    def chunk(kind, value):
+        return (struct.pack("!I", len(value)) + kind + value
+                + struct.pack("!I", zlib.crc32(kind + value) & 0xffffffff))
+
+    compressor = zlib.compressobj(3)
+    compressed = bytearray()
+    count = 0
+    for row in rows:
+        if len(row) != width * 3 or count >= height:
+            raise AgentError("Compositor image has invalid pixel rows")
+        compressed.extend(compressor.compress(b"\0" + row))
+        count += 1
+    if count != height:
+        raise AgentError("Compositor image has missing pixel rows")
+    compressed.extend(compressor.flush())
+    return (b"\x89PNG\r\n\x1a\n"
+            + chunk(b"IHDR", struct.pack("!IIBBBBB", width, height, 8, 2, 0, 0, 0))
+            + chunk(b"IDAT", bytes(compressed)) + chunk(b"IEND", b""))
+
+
+def _ppm_header(output):
+    """Read P6 header with a fixed limit, leaving the cursor at its first RGB byte."""
+    read = 0
+
+    def byte():
+        nonlocal read
+        if read >= MAX_PPM_HEADER:
+            raise AgentError("Compositor PPM header exceeds the byte limit")
+        value = output.read(1)
+        read += 1
+        if not value:
+            raise AgentError("Compositor PPM header is incomplete")
+        return value[0]
+
+    if bytes((byte(), byte())) != b"P6":
+        raise AgentError("grim returned an invalid PPM header")
+
+    def token():
+        value = byte()
+        while True:
+            if value == 35:  # PPM permits comments between header values.
+                while byte() != 10:
+                    pass
+            elif value in b" \t\r\n":
+                pass
+            else:
+                break
+            value = byte()
+        digits = bytearray()
+        while 48 <= value <= 57:
+            digits.append(value)
+            if len(digits) > 10:
+                raise AgentError("grim returned an invalid PPM header")
+            value = byte()
+        if not digits or value not in b" \t\r\n":
+            raise AgentError("grim returned an invalid PPM header")
+        return int(digits)
+
+    # Require separator after magic; token() must not silently accept P6123.
+    separator = byte()
+    if separator not in b" \t\r\n":
+        raise AgentError("grim returned an invalid PPM header")
+    output.seek(-1, os.SEEK_CUR)
+    read -= 1
+    width, height, maxval = token(), token(), token()
+    if maxval != 255:
+        raise AgentError("grim returned an unsupported PPM maximum value")
+    _dimensions(width, height)
+    return width, height, output.tell()
+
+
+def _ppm_png(output, desktop_width, desktop_height, region, max_width):
+    source_width, source_height, raster_start = _ppm_header(output)
+    if (source_width, source_height) != (desktop_width, desktop_height):
+        raise AgentError("Compositor screenshot dimensions differ from the input desktop; reconnect after display changes",
+                         code="geometry_changed")
+    output.seek(0, os.SEEK_END)
+    if output.tell() != raster_start + source_width * source_height * 3:
+        raise AgentError("Compositor PPM pixel payload has an invalid size")
+    x, y, width, height = region
+    image_width = min(width, max_width if max_width is not None else width)
+    image_height = max(1, height * image_width // width)
+    sample_x = [(2 * col + 1) * width // (2 * image_width) for col in range(image_width)]
+
+    def rows():
+        for row in range(image_height):
+            source_y = y + (2 * row + 1) * height // (2 * image_height)
+            output.seek(raster_start + (source_y * source_width + x) * 3)
+            source = output.read(width * 3)
+            if len(source) != width * 3:
+                raise AgentError("Compositor PPM pixel payload is truncated")
+            if image_width == width:
+                yield source
+            else:
+                target = bytearray(image_width * 3)
+                for col, source_x in enumerate(sample_x):
+                    target[col * 3:col * 3 + 3] = source[source_x * 3:source_x * 3 + 3]
+                yield target
+
+    return _png_rgb_rows(image_width, image_height, rows())
 
 
 class RFBClient:
@@ -442,26 +550,36 @@ class OwnedWayVNC:
         finally:
             self.capture_process = None
 
-    def screenshot_png(self):
+    def screenshot_png(self, region=None, max_width=None):
         """Capture the actual compositor output, never WayVNC's cached frame."""
+        self.check_geometry()
         executable = shutil.which("grim")
         if not executable:
             raise AgentError("Install the grim package on the Pi to capture its desktop", code="missing_dependency")
+        transformed = region is not None or max_width is not None
         # An anonymous private file keeps subprocess output out of stdout and
         # avoids an unbounded in-memory communicate() result before size checks.
         with tempfile.TemporaryFile(dir=self.directory) as output:
             try:
+                command = ([executable, "-c", "-t", "ppm", "-o", self.output_name, "-"] if transformed else
+                           [executable, "-c", "-t", "png", "-l", "3", "-o", self.output_name, "-"])
                 self.capture_process = subprocess.Popen(
-                    [executable, "-c", "-t", "png", "-l", "3", "-o", self.output_name, "-"],
+                    command,
                     stdin=subprocess.DEVNULL, stdout=output, stderr=sys.stderr,
                     env=self.environment, close_fds=True, start_new_session=True, umask=0o077,
                 )
                 if self.capture_process.wait(timeout=IO_TIMEOUT) != 0:
                     raise AgentError("grim could not capture the compositor output; see stderr diagnostics")
                 size = output.seek(0, os.SEEK_END)
-                if size > MAX_PNG_BYTES:
+                if size > (MAX_PPM_BYTES if transformed else MAX_PNG_BYTES):
                     raise AgentError("Compositor image exceeds the byte limit")
                 output.seek(0)
+                if transformed:
+                    if region is None:
+                        region = (0, 0, self.client.width, self.client.height)
+                    data = _ppm_png(output, self.client.width, self.client.height, region, max_width)
+                    self.check_geometry()
+                    return data
                 header = output.read(33)
                 if (len(header) != 33 or header[:8] != b"\x89PNG\r\n\x1a\n"
                         or header[8:16] != b"\0\0\0\rIHDR"
@@ -474,6 +592,7 @@ class OwnedWayVNC:
                 data = header + output.read(MAX_PNG_BYTES - len(header) + 1)
                 if not data.endswith(b"\0\0\0\0IEND\xaeB`\x82"):
                     raise AgentError("grim returned an incomplete PNG")
+                self.check_geometry()
                 return data
             except subprocess.TimeoutExpired as exc:
                 raise AgentError("Compositor capture timed out") from exc
@@ -538,10 +657,10 @@ BUTTONS = {"left": 1, "middle": 2, "right": 4}
 WHEEL = {"up": 8, "down": 16, "left": 32, "right": 64}
 PARAMETERS = {
     "hello": set(), "health": set(),
-    "status": set(), "screenshot": set(), "disconnect": set(),
-    "move": {"x", "y"}, "click": {"x", "y", "button", "count"},
-    "drag": {"start_x", "start_y", "end_x", "end_y", "button", "steps"},
-    "scroll": {"x", "y", "direction", "ticks"}, "type_text": {"text"}, "key": {"keys"},
+    "status": set(), "screenshot": {"x", "y", "width", "height", "max_width"}, "disconnect": set(),
+    "move": {"x", "y", "frame_id"}, "click": {"x", "y", "button", "count", "frame_id"},
+    "drag": {"start_x", "start_y", "end_x", "end_y", "button", "steps", "frame_id"},
+    "scroll": {"x", "y", "direction", "ticks", "frame_id"}, "type_text": {"text"}, "key": {"keys"},
 }
 INPUT_METHODS = frozenset({"move", "click", "drag", "scroll", "type_text", "key"})
 
@@ -572,6 +691,8 @@ class DesktopAgent:
         self.pointer_held = False
         self.typing_process = None
         self.input_started = False
+        self.latest_frame_id = None
+        self.latest_frame_client = None
 
     def _coordinates(self, params, x="x", y="y"):
         return (_integer(params.get(x), x, 0, 65535),
@@ -579,6 +700,7 @@ class DesktopAgent:
 
     def _pointer(self, position, mask=0):
         # Track before send: sendall can fail after the peer received the event.
+        self._consume_frame()
         self.input_started = True
         self.position = position
         if mask:
@@ -613,6 +735,7 @@ class DesktopAgent:
     def _chord(self, values):
         try:
             for value in values:
+                self._consume_frame()
                 self.held_keys.append(value)
                 self.input_started = True
                 self.client.key_event(value, True)
@@ -643,6 +766,7 @@ class DesktopAgent:
         # wtype decodes stdin using the locale; an SSH session may otherwise use C.
         environment["LC_ALL"] = "C.UTF-8"
         try:
+            self._consume_frame()
             self.typing_process = subprocess.Popen(
                 [executable, "-d", "2", "-"], stdin=subprocess.PIPE,
                 stdout=subprocess.DEVNULL, stderr=sys.stderr, env=environment,
@@ -659,6 +783,10 @@ class DesktopAgent:
         finally:
             self._stop_typing()
 
+    def _consume_frame(self):
+        self.latest_frame_id = None
+        self.latest_frame_client = None
+
     def _prepare(self, method, params):
         """Reject malformed actions before any desktop session is acquired."""
         if not isinstance(method, str) or method not in PARAMETERS:
@@ -666,6 +794,25 @@ class DesktopAgent:
         if not isinstance(params, dict) or any(key not in PARAMETERS[method] for key in params):
             raise AgentError("Invalid parameters for " + method, code="invalid_params")
         prepared = {}
+        if method == "screenshot":
+            region_keys = {"x", "y", "width", "height"}
+            present = region_keys.intersection(params)
+            if present and present != region_keys:
+                raise AgentError("Provide x, y, width, and height together", code="invalid_params")
+            if present:
+                x, y = self._coordinates(params)
+                width = _integer(params["width"], "width", 1, 65535)
+                height = _integer(params["height"], "height", 1, 65535)
+                if width * height > MAX_PIXELS:
+                    raise AgentError("Screenshot region exceeds 16 megapixels", code="invalid_params")
+                prepared["region"] = (x, y, width, height)
+            if "max_width" in params:
+                prepared["max_width"] = _integer(params["max_width"], "max_width", 1, 65535)
+        if method in ("move", "click", "drag", "scroll") and "frame_id" in params:
+            frame_id = params["frame_id"]
+            if type(frame_id) is not str or re.fullmatch(r"[0-9a-f]{32}", frame_id) is None:
+                raise AgentError("frame_id must be 32 lowercase hexadecimal characters", code="invalid_params")
+            prepared["frame_id"] = frame_id
         if method in ("move", "click"):
             prepared["position"] = self._coordinates(params)
         if method in ("click", "drag"):
@@ -760,8 +907,13 @@ class DesktopAgent:
             if previous_client is not None and self.client is not previous_client:
                 was_active = False  # A replacement lease must not survive a rejected action.
                 self.position = None
+                self._consume_frame()
                 if method == "scroll" and not prepared["targeted"]:
                     raise AgentError("Provide x and y after reconnecting the desktop session", code="invalid_params")
+            if "frame_id" in prepared and (prepared["frame_id"] != self.latest_frame_id
+                                           or self.latest_frame_client is not self.client):
+                raise AgentError("Screenshot view is stale; take a fresh screenshot before sending input",
+                                 code="stale_view")
             if method in INPUT_METHODS:
                 self.session.check_geometry()
             for key in ("position", "start", "end"):
@@ -774,9 +926,26 @@ class DesktopAgent:
                         "height": self.client.height, "desktop_name": self.client.name,
                         "wayland_display": self.session.wayland_display}
             if method == "screenshot":
-                png = self.session.screenshot_png()
-                return {"image_base64": base64.b64encode(png).decode("ascii"),
-                        "mime_type": "image/png", "width": self.client.width, "height": self.client.height}
+                desktop_width, desktop_height = self.client.width, self.client.height
+                region = prepared.get("region", (0, 0, desktop_width, desktop_height))
+                x, y, width, height = region
+                if x + width > desktop_width or y + height > desktop_height:
+                    raise AgentError("Screenshot region is outside desktop dimensions", code="invalid_params")
+                max_width = prepared.get("max_width")
+                if "region" in prepared or max_width is not None:
+                    png = self.session.screenshot_png(region, max_width)
+                else:
+                    png = self.session.screenshot_png()
+                image_width = min(width, max_width if max_width is not None else width)
+                image_height = max(1, height * image_width // width)
+                result = {"image_base64": base64.b64encode(png).decode("ascii"),
+                          "mime_type": "image/png", "width": image_width, "height": image_height,
+                          "desktop_width": desktop_width, "desktop_height": desktop_height,
+                          "region": {"x": x, "y": y, "width": width, "height": height},
+                          "frame_id": secrets.token_hex(16)}
+                self.latest_frame_id = result["frame_id"]
+                self.latest_frame_client = self.client
+                return result
             if method == "move":
                 self._pointer(prepared["position"])
             elif method in ("click", "scroll"):
@@ -813,7 +982,7 @@ class DesktopAgent:
                 if exc.code == "operation_failed":
                     exc.code = "input_failed"
             preserve = was_active and not self.input_started and exc.code in {
-                "invalid_params", "unknown_method", "missing_dependency"}
+                "invalid_params", "unknown_method", "missing_dependency", "stale_view"}
             if not preserve:
                 self.close()
             raise
@@ -839,6 +1008,7 @@ class DesktopAgent:
                 print("pi-desktop-agent session cleanup: " + type(exc).__name__, file=sys.stderr)
             finally:
                 self.client = None
+                self._consume_frame()
                 self.held_keys.clear()
                 self.pointer_held = False
                 self.position = None

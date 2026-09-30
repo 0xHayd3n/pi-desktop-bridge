@@ -2,7 +2,7 @@
 
 An MCP server that lets Codex and other MCP-enabled assistants see and operate a Raspberry Pi's Wayland desktop through an existing SSH connection.
 
-The bridge returns real PNG screenshots to the model and provides mouse movement, clicks, dragging, scrolling, text entry and keyboard shortcuts. Input tools return a fresh screenshot after the action. It runs over SSH and uses a private WayVNC UNIX socket on the Pi; no VNC or web port is opened.
+The bridge returns real PNG screenshots to the model and provides mouse movement, clicks, dragging, scrolling, text entry and keyboard shortcuts. Screenshots can show a smaller overview or a full-resolution region, with image coordinates mapped back to the desktop. Input tools return a fresh full screenshot after the action. It runs over SSH and uses a private WayVNC UNIX socket on the Pi; no VNC or web port is opened.
 
 ## Requirements
 
@@ -59,7 +59,7 @@ This is a configuration example, not a universal IDE extension. The client must 
 | --- | --- |
 | `desktop_health` | Check agent and desktop prerequisites without taking control |
 | `desktop_status` | Desktop size and connection information |
-| `desktop_screenshot` | Current PNG screenshot |
+| `desktop_screenshot` | Full PNG, region detail, or a smaller overview using `max_width` |
 | `desktop_move` | Move to absolute screenshot pixel coordinates |
 | `desktop_click` | Left, middle or right click; single or double |
 | `desktop_drag` | Drag between two screenshot coordinates |
@@ -68,7 +68,13 @@ This is a configuration example, not a universal IDE extension. The client must 
 | `desktop_key` | Press a key or shortcut, for example `["Control_L", "a"]` |
 | `desktop_disconnect` | Release the desktop; the next observation reconnects |
 
-Coordinates use the original screenshot's dimensions and top-left origin. Take a screenshot before choosing a target. The tools operate the active desktop, so a local person moving focus can change where subsequent input goes. Keyboard behavior depends on the target app and compositor; the live verification checks the actual Pi rather than inferring behavior from protocol messages.
+By default, mouse coordinates use the original desktop's dimensions and top-left origin. Take a screenshot before choosing a target. The tools operate the active desktop, so a local person moving focus can change where subsequent input goes. Keyboard behavior depends on the target app and compositor; the live verification checks the actual Pi rather than inferring behavior from protocol messages.
+
+When switching windows, move the pointer into the target window and inspect the returned screenshot before clicking. Focus and compositor behavior can affect click delivery; the bridge does not repeat clicks automatically.
+
+For a smaller overview, call `desktop_screenshot` with `{"max_width": 960}`. For original-pixel detail, pass a region such as `{"x": 200, "y": 150, "width": 640, "height": 400}`. Supply all four region fields together; they refer to the original desktop. `max_width` also works with regions and never enlarges an image. Downsampling uses nearest-neighbor pixel centers; use a native-resolution region to read small text.
+
+Each image includes JSON metadata with `view_id`, its actual pixel dimensions, the original desktop size and the source region. To use coordinates measured in that image, supply its `view_id` to `desktop_move`, `desktop_click`, `desktop_drag` or targeted `desktop_scroll`. The bridge performs the conversion. Without `view_id`, those tools continue to take original desktop coordinates. A new capture, an input action, disconnect or a replaced session invalidates older views. A rejected stale view sends no input; capture again to obtain the current view. A view ID verifies the capture/session relationship; it cannot detect application changes or someone moving focus since the image was taken.
 
 For scrolling, pass both `x` and `y` inside the visible pane. Omitting them uses the last position moved by this bridge; a new connection rejects an untargeted scroll rather than guessing a position. Before sending input, the agent verifies that the captured output and its dimensions still match the input session. A changed display rejects the action before delivery; take a new screenshot to reconnect with its current geometry.
 
@@ -78,7 +84,7 @@ Call `desktop_disconnect` when finished so another client can use the Pi without
 
 The client checks protocol compatibility before its first operation on each SSH connection. Update the repo, run `uv sync --frozen`, deploy the agent again and restart the MCP server when upgrading. A compatible protocol alone does not prove that the deployed source is current; `doctor` also compares its SHA-256.
 
-Validation and prerequisite errors explain what was rejected and confirm that input did not start. If delivery becomes uncertain, or input was acknowledged but its resulting image could not be captured, further input is blocked until `desktop_screenshot` succeeds. Input is never automatically replayed. Health, status and disconnect do not clear this observation requirement.
+Validation and prerequisite errors explain what was rejected and confirm that input did not start. If delivery becomes uncertain, or input was acknowledged but its resulting image could not be captured, further input is blocked until an explicit full-desktop `desktop_screenshot` succeeds. A region capture does not clear this requirement. A full-desktop overview with `max_width` can clear it. Input is never automatically replayed. Health, status and disconnect do not clear this observation requirement.
 
 Each MCP tool has one request budget covering its queue wait, protocol handshake, input and resulting capture (60 seconds by default). A queued call that is cancelled or expires sends no input and does not cancel the active call. If input has already started, cancellation waits for that bounded operation and its cleanup before releasing the session lock, then requires a fresh screenshot. Stopping an owned SSH process has a separate bounded cleanup allowance.
 
@@ -97,9 +103,10 @@ Then install/enable Pi Desktop Bridge from that marketplace in a compatible Code
 ```sh
 uv run python -m unittest discover -s tests -v
 uv run python scripts/live_smoke.py --host pi-desktop
+uv run python scripts/live_views.py --host pi-desktop
 ```
 
-The first command uses fake protocol peers to check framing, bounds, PNG pixels, held-input release, concurrency, deployment and error handling. The second is an **opt-in real desktop test**: it opens a disposable Tk window on the Pi, exercises the real MCP stdio client and desktop input, then closes and removes the fixture. It needs `tkinter` and an Xwayland display at `:0` on the Pi. Screenshots and the report are saved under ignored `_local/live/` and are not published.
+The first command uses fake protocol peers to check framing, bounds, PNG pixels, held-input release, concurrency, deployment and error handling. The other commands are **opt-in real desktop tests**: they open a disposable Tk window on the Pi, exercise the real MCP stdio client and desktop input, then close and remove the fixture. The views test also compares crop RGB pixels with a full capture, exercises image-coordinate input, and records payload sizes and request times. Both need `tkinter` and an Xwayland display at `:0` on the Pi. Screenshots and reports are saved under ignored `_local/` and are not published.
 
 See the [verification record](docs/verification.md) for actual checks and remaining integration limits.
 

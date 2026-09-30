@@ -13,7 +13,7 @@ def main():
     root.title("Pi Desktop Bridge — verification")
     root.geometry("640x430+200+150")
     root.attributes("-topmost", True)
-    state = {"clicks": 0, "scrolls": 0, "hotkeys": 0, "drag": [], "text": ""}
+    state = {"clicks": 0, "scrolls": 0, "hotkeys": 0, "drag": [], "text": "", "button_events": []}
     text = tk.StringVar()
 
     def save(*_):
@@ -43,9 +43,19 @@ def main():
 
     button = tk.Button(root, text="Click to verify", command=click, font=("Sans", 16))
     button.pack(pady=8)
+
+    def button_event(event):
+        state["button_events"].append({"type": str(event.type), "x": event.x, "y": event.y})
+        save()
+
+    for event_name in ("<Enter>", "<ButtonPress-1>", "<ButtonRelease-1>"):
+        button.bind(event_name, button_event, add="+")
     canvas = tk.Canvas(root, width=560, height=150, bg="#153046", highlightthickness=0)
     canvas.pack(pady=8)
     canvas.create_text(280, 25, text="Drag here and scroll here", fill="white", font=("Sans", 14))
+    for index, color in enumerate(("#ff0000", "#00ff00", "#0000ff", "#ffffff")):
+        canvas.create_rectangle(20 + index * 10, 72, 27 + index * 10, 79,
+                                fill=color, outline="")
 
     def drag_start(event):
         state["drag"] = [[event.x, event.y]]

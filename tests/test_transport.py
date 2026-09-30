@@ -20,7 +20,7 @@ from pi_desktop_bridge.transport import (
 )
 
 
-HELLO = {"protocol_version": 2, "agent_version": "0.2.0", "agent_sha256": "a" * 64,
+HELLO = {"protocol_version": 3, "agent_version": "0.3.0", "agent_sha256": "a" * 64,
          "capabilities": sorted(REQUIRED_CAPABILITIES)}
 
 

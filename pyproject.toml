@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "pi-desktop-bridge"
-version = "0.2.0"
+version = "0.3.0"
 description = "Give MCP-enabled assistants screenshot and input access to a Raspberry Pi desktop over SSH."
 readme = "README.md"
 requires-python = ">=3.11"
