@@ -379,6 +379,9 @@ class GUITransportTests(unittest.TestCase):
             def __init__(self) -> None:
                 self.options: dict = {}
 
+            def load_system_host_keys(self, filename) -> None:
+                pass
+
             def set_missing_host_key_policy(self, policy) -> None:
                 pass
 
