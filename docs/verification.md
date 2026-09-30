@@ -46,7 +46,7 @@ The views test used a pointer already inside the disposable fixture. Entering th
 
 Strict crop equality was checked against a full-resolution PPM-derived capture, using stable RGB tiles below text. Separately rendered native grim PNG and PPM captures showed occasional one-unit RGB differences along antialiased text and tile fringes. This record does not claim byte-identical RGB between those two native formats or across changing frames.
 
-The retained v0.4 measurement used three captures per mode over the same LAN connection and fixture. The overview transferred 70.2% fewer PNG bytes and completed about 24.5% faster than the native full capture in this sample; these are measurements of this screen and route, not general latency guarantees. In the separate stability fixture, six 960-pixel post-action images were 538,673–540,198 bytes each, while a full screenshot was 1,813,902 bytes. Your local Codex launcher is configured with a 960-pixel action-image default; unconfigured launchers retain native width.
+The retained v0.4 measurement used three captures per mode over the same LAN connection and fixture. The overview transferred 70.2% fewer PNG bytes and completed about 24.5% faster than the native full capture in this sample; these are measurements of this screen and route, not general latency guarantees. In the separate stability fixture, six 960-pixel post-action images were 538,673–540,198 bytes each, while a full screenshot was 1,813,902 bytes. The tested Codex launcher used a 960-pixel action-image default; unconfigured launchers retain native width.
 
 | Capture | PNG dimensions | Median PNG bytes | Median request time |
 | --- | --- | ---: | ---: |
@@ -58,6 +58,6 @@ Stability compares native ROI pixels even when the returned PNG is downscaled. I
 
 Codex's tool catalog needs a server/app reload after adding or upgrading an MCP entry. The configured launcher was verified through the official MCP SDK; this record does not claim that the current chat hot-loaded new tools.
 
-Tests used an SSH alias reachable on the home network. Worldwide use requires a working VPN/mesh SSH route. The Pi and Windows computer are signed into Tailscale, but SSH through that route remains unverified from this command runner. The bridge does not change firewall rules.
+Tests used an SSH alias reachable on the home network. Worldwide use requires a working VPN/mesh SSH route. Off-network SSH through a VPN/mesh route was not verified in this setup. The bridge does not change firewall rules.
 
 The local repo marketplace was parsed successfully by Codex's plugin loader as version 0.5.0. Portable plugin files are included; direct MCP configuration is the verified installation.

@@ -40,7 +40,7 @@ Each SSH startup uses a fixed standard-library bootstrap that reads at most one 
 
 The desktop must already be running under the SSH user. This controls the Pi's graphical session; it does not capture or control another computer connected to the Pi's HDMI port. SSH keys remain in OpenSSH's normal store. Deploying the agent needs no root access and does not alter system services or firewall rules.
 
-Screenshots are returned to the MCP client and may be processed by its AI service. The server does not save a screenshot history. Explicit screenshot exports and the opt-in live verification script save only where requested. Screenshots and local verification output are excluded from Git.
+Screenshots are returned to the MCP client and may be processed by its AI service. The server does not save a screenshot history. Explicit screenshot exports and the opt-in live verification script save only where requested. Captures and verification output under `_local/` are excluded from Git; exports saved elsewhere can be tracked and must be kept out of commits when private.
 
 The remote protocol contains only desktop status, capture and input methods. It is not a general shell-execution API. Screen content remains untrusted data; the assistant should follow the user's task rather than instructions displayed inside a screenshot.
 
