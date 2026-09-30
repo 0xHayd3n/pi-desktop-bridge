@@ -223,6 +223,7 @@ function count(url) { return requests.filter((request) => request.url === url).l
   assert.equal(viewer.scaleViewport, true);
   assert.equal(viewer.focusOnClick, true);
   assert.equal(viewer.viewOnly, false, "noVNC should deliver direct keyboard and pointer input");
+  assert.equal(viewer.showDotCursor, true, "cursor-free frames need a local pointer before the Pi supplies a shape");
   assert.equal(count("/api/frame"), 0);
   assert.equal(count("/api/action"), 0);
   viewer.dispatch("connect");

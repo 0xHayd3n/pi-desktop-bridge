@@ -514,7 +514,7 @@ class ProtocolV4Tests(unittest.TestCase):
              mock.patch.object(agent.subprocess, "Popen") as spawn:
             result = self.desktop.dispatch("hello", {})
         self.assertEqual(result["protocol_version"], 4)
-        self.assertEqual(result["agent_version"], "0.6.0")
+        self.assertEqual(result["agent_version"], "0.6.1")
         self.assertRegex(result["agent_sha256"], r"^[0-9a-f]{64}$")
         self.assertEqual(set(result["capabilities"]), {"hello", "health", "status", "screenshot", "wait_for_stable", "move", "click", "drag", "scroll", "type_text", "key", "disconnect"})
         ensure.assert_not_called()
@@ -701,7 +701,7 @@ class ProtocolV4Tests(unittest.TestCase):
 
 
 class LifecycleTests(unittest.TestCase):
-    def test_stream_start_requests_prompt_capture_without_compositor_screenshot(self):
+    def test_stream_start_uses_local_cursor_without_compositor_screenshot(self):
         with tempfile.TemporaryDirectory() as runtime:
             wire = FragmentedSocket(handshake())
             wire.connect = mock.Mock()
@@ -717,11 +717,13 @@ class LifecycleTests(unittest.TestCase):
                  mock.patch.object(agent.socket, "socket", return_value=wire):
                 session = agent.OwnedWayVNC()
                 try:
-                    client = session.ensure(max_fps=agent.STREAM_MAX_FPS, prime_capture=False)
+                    client = session.ensure(max_fps=agent.STREAM_MAX_FPS, prime_capture=False, render_cursor=False)
                     self.assertEqual((client.width, client.height), (2, 1))
                     select_output.assert_called_once()
                     capture.assert_not_called()
                     argv = spawn.call_args.args[0]
+                    self.assertNotIn("-r", argv)
+                    self.assertIn("-R", argv)
                     self.assertEqual(argv[argv.index("-f") + 1], "1000")
                     self.assertEqual(argv[-1], str(session.directory / "rfb.sock"))
                 finally:
@@ -1676,7 +1678,7 @@ class StreamEntryTests(unittest.TestCase):
         self.assertTrue(all(len(line) < 4096 for line in result.output.splitlines()))
         self.assertEqual(result.source.read(), b"RFB 003.008\n")
         self.assertLessEqual(max(result.reads), 6)
-        result.session.ensure.assert_called_once_with(max_fps=1000, prime_capture=False)
+        result.session.ensure.assert_called_once_with(max_fps=1000, prime_capture=False, render_cursor=False)
         result.connection.connect.assert_called_once_with(str(Path("/private/owned/rfb.sock")))
         result.relay.assert_called_once_with(result.connection, 10, 11, result.session.process)
         result.connection.close.assert_called_once()

@@ -10,7 +10,7 @@ import tempfile
 import threading
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import paramiko
 
@@ -120,7 +120,7 @@ class _LocalSSHServer:
                         if method == "hello":
                             result = {
                                 "protocol_version": PROTOCOL_VERSION,
-                                "agent_version": "0.6.0",
+                                "agent_version": "0.6.1",
                                 "agent_sha256": self.agent_hash,
                                 "capabilities": sorted(REQUIRED_CAPABILITIES),
                             }
@@ -223,6 +223,9 @@ class GUITransportTests(unittest.TestCase):
             ):
                 bridge = connect_gui(_details(server, expected=_fingerprint(server.key)))
                 try:
+                    tcp_socket = bridge._client.get_transport().sock
+                    self.assertIsInstance(tcp_socket, socket.socket)
+                    self.assertEqual(tcp_socket.getsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY), 1)
                     self.assertEqual(bridge.request("status"), {"ok": True})
                     self.assertEqual(bridge.disconnect(), {"ok": True})
                 finally:
@@ -388,6 +391,9 @@ class GUITransportTests(unittest.TestCase):
             def connect(self, **kwargs) -> None:
                 self.options = kwargs
 
+            def get_transport(self):
+                return None
+
             def close(self) -> None:
                 pass
 
@@ -403,6 +409,28 @@ class GUITransportTests(unittest.TestCase):
                 self.assertEqual(client.options["allow_agent"], expected)
                 self.assertEqual(client.options["look_for_keys"], expected)
                 self.assertEqual(client.options["password"], password or None)
+
+    def test_nodelay_is_best_effort_for_socket_wrappers_and_socket_errors(self) -> None:
+        with socket.socket() as native_socket:
+            wrapper = Mock()
+            for endpoint in (wrapper, native_socket):
+                with self.subTest(native=isinstance(endpoint, socket.socket)), tempfile.TemporaryDirectory() as directory:
+                    client = Mock()
+                    client.get_transport.return_value.sock = endpoint
+                    with patch("pi_desktop_bridge.gui_transport.Path.home", return_value=Path(directory)), patch(
+                        "pi_desktop_bridge.gui_transport.paramiko.SSHClient", return_value=client
+                    ), patch("pi_desktop_bridge.gui_transport._checked_transport", return_value="checked"), patch.object(
+                        socket.socket, "setsockopt", side_effect=OSError("socket option unavailable")
+                    ) as set_option:
+                        result = connect_gui({"mode": "password", "host": "127.0.0.1", "username": "pi",
+                                              "password": "secret", "deploy": False})
+                    self.assertEqual(result, "checked")
+                    client.close.assert_not_called()
+                    if endpoint is native_socket:
+                        set_option.assert_called_once_with(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                    else:
+                        set_option.assert_not_called()
+                        wrapper.setsockopt.assert_not_called()
 
     def test_fixed_deployment_streams_packaged_source_and_verifies_digest(self) -> None:
         class Channel:

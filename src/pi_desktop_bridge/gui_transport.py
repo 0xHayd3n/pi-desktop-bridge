@@ -439,6 +439,13 @@ def connect_gui(details: dict[str, Any]) -> SSHTransport:
         finally:
             password = None
             values["password"] = ""
+        tcp_socket = getattr(client.get_transport(), "sock", None)
+        if isinstance(tcp_socket, socket.socket) and tcp_socket.family in {socket.AF_INET, socket.AF_INET6}:
+            try:
+                # Send small RFB input messages promptly on the shared SSH connection.
+                tcp_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            except (AttributeError, OSError):
+                pass  # Socket tuning must not turn a successful login into a failure.
         if values["deploy"]:
             _deploy_password(client, min(deadline, time.monotonic() + _DEPLOY_BUDGET))
         bridge = GUITransport(host, client)

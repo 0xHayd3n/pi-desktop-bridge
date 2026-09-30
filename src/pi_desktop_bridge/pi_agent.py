@@ -49,7 +49,7 @@ MAX_PNG_BYTES = MAX_PIXELS * 4 + MAX_TEXT_BYTES
 MAX_PPM_HEADER = 256
 MAX_PPM_BYTES = MAX_PIXELS * 3 + MAX_PPM_HEADER
 PROTOCOL_VERSION = 4
-AGENT_VERSION = "0.6.0"
+AGENT_VERSION = "0.6.1"
 # Identify the source that this process loaded, even if deployment replaces it.
 AGENT_SHA256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
 
@@ -442,7 +442,7 @@ class OwnedWayVNC:
         self.output_geometry = None
         self.capture_process = None
 
-    def ensure(self, *, max_fps=None, prime_capture=True):
+    def ensure(self, *, max_fps=None, prime_capture=True, render_cursor=True):
         if self.client is not None:
             if self.process.poll() is None:
                 return self.client
@@ -463,8 +463,10 @@ class OwnedWayVNC:
             # Explicitly ignore the user's configuration: it may enable TCP,
             # authentication, or a shared control socket. umask applies to child
             # sockets without changing this process's global file permissions.
-            command = [executable, "-C", os.devnull, "-u", "-S", str(self.directory / "control.sock"),
-                       "-r", "-R"]
+            command = [executable, "-C", os.devnull, "-u", "-S", str(self.directory / "control.sock")]
+            if render_cursor:
+                command.append("-r")
+            command.append("-R")
             if max_fps is not None:
                 command.extend(["-f", str(max_fps)])
             command.append(rfb_socket)
@@ -1330,7 +1332,8 @@ def stream_main():
             "agent_version": AGENT_VERSION, "agent_sha256": AGENT_SHA256,
         }, time.monotonic() + IO_TIMEOUT)
         _stream_read_start(incoming_fd, time.monotonic() + IO_TIMEOUT)
-        probe = session.ensure(max_fps=STREAM_MAX_FPS, prime_capture=False)
+        # The browser draws the cursor locally; do not also bake it into frames.
+        probe = session.ensure(max_fps=STREAM_MAX_FPS, prime_capture=False, render_cursor=False)
         # The probe validates geometry and output power without grim. Keep it
         # owned until teardown, but give the viewer a fresh, untouched handshake.
         _dimensions(probe.width, probe.height)

@@ -1,5 +1,18 @@
 # Verification record
 
+## v0.6.1 responsiveness checks
+
+Version 0.6.1 keeps protocol 4. The packaged agent SHA-256 is `bd4bd5c690c656bed99b141cd230cc55464ef34727a35ae7b155dcb6ac5512c0`. The Pi was offline during this update, so deployment, cursor-shape capture on the actual compositor, and a new live key-to-screen comparison remain unverified. The v0.6.0 measurements below are retained historical evidence.
+
+- Raw stream startup omits WayVNC's baked cursor, while the default MCP session keeps it. All 128 agent tests passed on Windows Python 3.14/3.11 (nine Linux-only skips each) and WSL Ubuntu (no skips).
+- Direct Paramiko login enables `TCP_NODELAY` after authentication. A disposable real SSH server verified the native socket option; unsupported wrappers and option failures preserve a healthy connection. All sixteen GUI transport tests passed on both Python versions.
+- The browser gesture harness verifies the local cursor fallback configuration along with existing input ordering, held-key release, clipboard, queue, timeout and reconnect behavior.
+- The actual Codex browser loaded pinned noVNC against a local synthetic RFB peer. Before any framebuffer pixels arrived, its visible 3 × 3 dot worked and a pointer event carried the expected scaled coordinates within one pixel. A Cursor pseudo-rectangle replaced the dot with a rendered opaque red 8 × 8 arrow, and a second pointer event retained the expected coordinates. This verifies the browser side without contacting the Pi.
+- Full Windows suites passed on Python 3.14 and 3.11: 304 tests each, with ten expected Linux-only skips. Frozen dependency synchronization accepted all 0.6.1 version metadata.
+- An actual Codex-browser comparison used generated 1920 × 1080 images containing 510 JPEG tiles per frame. The existing decoder's median enqueue/decode/draw/flush time was 80.8 ms over four frames; a Blob/`createImageBitmap` candidate took 181.7 ms. Sampled pixels matched within one channel value, and all 510 candidate bitmaps closed. The slower candidate was rejected. This synthetic full-frame workload does not measure live Pi latency or monitor presentation.
+
+## Retained v0.6.0 evidence
+
 Version 0.6.0 verified on 30 September 2026 on the same Raspberry Pi 5 / Debian 13 / labwc setup described below. Protocol remains 4; the packaged and deployed agent SHA-256 is `f952f1022e4e4d61f72c579e8ffed828b74fc5a547ff603ae3ff2ea990a3dd88`.
 
 | v0.6 check | Result |

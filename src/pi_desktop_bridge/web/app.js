@@ -363,6 +363,9 @@ async function startStream() {
     viewer.resizeSession = false;
     viewer.focusOnClick = true;
     viewer.viewOnly = false;
+    // Raw frames exclude the pointer; noVNC moves the server's cursor locally.
+    // Keep a visible fallback until the Pi supplies a nontransparent shape.
+    viewer.showDotCursor = true;
     viewer.compressionLevel = 1;
     viewer.qualityLevel = 6;
     viewer.addEventListener("connect", () => {

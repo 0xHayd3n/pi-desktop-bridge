@@ -23,7 +23,7 @@ def record(value):
 
 
 HELLO = {"mode": "rfb_stream", "protocol_version": PROTOCOL_VERSION,
-         "agent_version": "0.6.0", "agent_sha256": EXPECTED_AGENT_SHA256}
+         "agent_version": "0.6.1", "agent_sha256": EXPECTED_AGENT_SHA256}
 READY = {"ready": True, "width": 1920, "height": 1080, "max_fps": 1000}
 BANNER = b"RFB 003.008\n\x00\xffbinary\n"
 
