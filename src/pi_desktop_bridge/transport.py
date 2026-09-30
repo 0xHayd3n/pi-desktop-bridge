@@ -8,20 +8,45 @@ import queue
 import re
 import subprocess
 import threading
+import time
 from collections import deque
 from typing import Any
+
+from . import PROTOCOL_VERSION
 
 
 AGENT_PATH = "~/.local/share/pi-desktop-bridge/pi_agent.py"
 # The agent permits PNG data up to 16 MP * 4 bytes plus 1 MiB. Base64 can
 # exceed 86 MiB, so retain a bounded pipe with room for JSON framing.
 MAX_RESPONSE_BYTES = 96 * 1024 * 1024
-MAX_REQUEST_BYTES = 4 * 1024 * 1024
+# Match the agent's line limit so oversized input is rejected before any write.
+MAX_REQUEST_BYTES = 65_536
 _HOST_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,252}$", re.ASCII)
+_ERROR_CODE_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$", re.ASCII)
+REQUIRED_CAPABILITIES = frozenset({
+    "hello", "health", "status", "screenshot", "move", "click", "drag",
+    "scroll", "type_text", "key", "disconnect",
+})
 
 
 class TransportError(RuntimeError):
     """The remote agent could not complete a request reliably."""
+
+    def __init__(
+        self, message: str, *, code: str = "transport_error",
+        input_state: str = "may_have_executed",
+    ) -> None:
+        super().__init__(message)
+        self.message = message
+        self.code = code
+        self.input_state = input_state
+
+
+class RemoteAgentError(TransportError):
+    """A valid remote rejection; the SSH session remains healthy."""
+
+    def __init__(self, code: str, message: str, input_state: str) -> None:
+        super().__init__(message, code=code, input_state=input_state)
 
 
 def validate_host(host: str) -> str:
@@ -64,20 +89,33 @@ class SSHTransport:
         self._responses: queue.Queue[bytes | BaseException] | None = None
         self._stderr_tail: deque[bytes] = deque(maxlen=16)
         self._next_id = 0
+        self._hello: dict[str, Any] | None = None
+
+    @staticmethod
+    def _remaining(deadline: float) -> float:
+        return max(0.0, deadline - time.monotonic())
+
+    def _deadline(self, deadline: float | None) -> float:
+        own = time.monotonic() + self.timeout
+        return min(own, deadline) if deadline is not None else own
 
     def _start(self) -> None:
         # The remote path is fixed code, not derived from tool arguments. The
         # leading tilde is intentionally unquoted for the remote shell to expand.
-        proc = subprocess.Popen(
-            ssh_argv(self.host, f"python3 -u {AGENT_PATH}"),
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            bufsize=0, env=_ssh_environment(),
-        )
+        try:
+            proc = subprocess.Popen(
+                ssh_argv(self.host, f"python3 -u {AGENT_PATH}"),
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                bufsize=0, env=_ssh_environment(),
+            )
+        except OSError as exc:
+            raise TransportError("Could not start SSH", input_state="not_started") from exc
         self._process = proc
         self._responses = queue.Queue(maxsize=2)
-        self._stderr_tail.clear()
+        self._stderr_tail = deque(maxlen=16)
+        self._hello = None
         threading.Thread(target=self._read_stdout, args=(proc, self._responses), daemon=True).start()
-        threading.Thread(target=self._drain_stderr, args=(proc,), daemon=True).start()
+        threading.Thread(target=self._drain_stderr, args=(proc, self._stderr_tail), daemon=True).start()
 
     def _read_stdout(self, proc: subprocess.Popen[bytes], responses: queue.Queue[bytes | BaseException]) -> None:
         assert proc.stdout is not None
@@ -110,13 +148,13 @@ class SSHTransport:
             except queue.Full:
                 pass
 
-    def _drain_stderr(self, proc: subprocess.Popen[bytes]) -> None:
+    def _drain_stderr(self, proc: subprocess.Popen[bytes], tail: deque[bytes]) -> None:
         assert proc.stderr is not None
         try:
             while chunk := os.read(proc.stderr.fileno(), 4096):
                 # Drain continuously to keep SSH from blocking. Never include
                 # remote stderr in MCP errors: it could contain private data.
-                self._stderr_tail.append(chunk[-256:])
+                tail.append(chunk[-256:])
         except OSError:
             pass
 
@@ -124,6 +162,7 @@ class SSHTransport:
         proc = self._process
         self._process = None
         self._responses = None
+        self._hello = None
         if proc is None:
             return
         if proc.stdin:
@@ -131,10 +170,14 @@ class SSHTransport:
                 proc.stdin.close()
             except OSError:
                 pass
+        # Cleanup has a separate bounded allowance after the request deadline.
         try:
             proc.wait(timeout=0.5)
         except subprocess.TimeoutExpired:
-            proc.kill()
+            try:
+                proc.kill()
+            except OSError:
+                pass
             try:
                 proc.wait(timeout=1)
             except subprocess.TimeoutExpired:
@@ -146,9 +189,11 @@ class SSHTransport:
                 except OSError:
                     pass
 
-    def _write_request(self, proc: subprocess.Popen[bytes], wire: bytes) -> None:
+    def _write_request(self, proc: subprocess.Popen[bytes], wire: bytes, deadline: float) -> None:
         if len(wire) > MAX_REQUEST_BYTES:
-            raise TransportError("SSH agent request exceeds size limit")
+            raise TransportError("SSH agent request exceeds size limit", input_state="not_started")
+        if self._remaining(deadline) <= 0:
+            raise TransportError("SSH agent request timed out before input was sent", input_state="not_started")
         assert proc.stdin is not None
         outcome: queue.Queue[BaseException | None] = queue.Queue(maxsize=1)
 
@@ -166,48 +211,124 @@ class SSHTransport:
 
         threading.Thread(target=write, daemon=True).start()
         try:
-            failure = outcome.get(timeout=self.timeout)
+            failure = outcome.get(timeout=self._remaining(deadline))
         except queue.Empty as exc:
-            raise TransportError(f"SSH agent write timed out after {self.timeout:g} seconds") from exc
+            raise TransportError("SSH agent write timed out; outcome is unknown") from exc
         if failure is not None:
             raise TransportError("SSH agent write failed") from failure
 
-    def request(self, method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
-        """Send one request; failed actions are never repeated automatically."""
-        with self._lock:
-            if self._process is None:
-                self._start()
-            assert self._process is not None and self._responses is not None
-            self._next_id += 1
-            request_id = self._next_id
+    def _exchange(self, method: str, params: dict[str, Any], deadline: float) -> dict[str, Any]:
+        assert self._process is not None and self._responses is not None
+        self._next_id += 1
+        request_id = self._next_id
+        try:
             wire = json.dumps(
-                {"id": request_id, "method": method, "params": params or {}},
+                {"id": request_id, "method": method, "params": params},
                 ensure_ascii=False, separators=(",", ":"),
             ).encode("utf-8") + b"\n"
+        except (TypeError, ValueError) as exc:
+            raise TransportError("Request arguments are not JSON serializable", input_state="not_started") from exc
+        self._write_request(self._process, wire, deadline)
+        try:
+            response = self._responses.get(timeout=self._remaining(deadline))
+        except queue.Empty as exc:
+            raise TransportError("SSH agent response timed out; outcome is unknown") from exc
+        if isinstance(response, BaseException):
+            raise TransportError("SSH agent closed its output or sent an invalid response") from response
+        try:
+            value = json.loads(response)
+        except (UnicodeDecodeError, ValueError, TypeError) as exc:
+            raise TransportError("SSH agent returned malformed JSON") from exc
+        if not isinstance(value, dict) or type(value.get("id")) is not int or value["id"] != request_id:
+            raise TransportError("SSH agent returned an invalid response id")
+        if ("result" in value) == ("error" in value):
+            raise TransportError("SSH agent returned an invalid response shape")
+        if "error" in value:
+            error = value["error"]
+            if not isinstance(error, dict):
+                raise TransportError("SSH agent returned a malformed error")
+            code = error.get("code")
+            message = error.get("message")
+            input_state = error.get("input_state")
+            if (
+                not isinstance(code, str) or not _ERROR_CODE_RE.fullmatch(code)
+                or not isinstance(message, str) or not 0 < len(message) <= 1024
+                or not isinstance(input_state, str)
+                or input_state not in {"not_started", "may_have_executed"}
+            ):
+                raise TransportError("SSH agent returned a malformed error")
+            raise RemoteAgentError(code, message, input_state)
+        result = value["result"]
+        if not isinstance(result, dict):
+            raise TransportError("SSH agent returned an invalid result")
+        return result
+
+    def _negotiate(self, deadline: float) -> None:
+        try:
+            hello = self._exchange("hello", {}, deadline)
+            capabilities = hello.get("capabilities")
+            if (
+                type(hello.get("protocol_version")) is not int
+                or hello["protocol_version"] != PROTOCOL_VERSION
+                or not isinstance(capabilities, list)
+                or not all(isinstance(item, str) for item in capabilities)
+                or not REQUIRED_CAPABILITIES.issubset(capabilities)
+            ):
+                raise TransportError("Agent protocol or capabilities are incompatible", input_state="not_started")
+            self._hello = hello
+        except (TransportError, OSError) as exc:
+            self._discard()
+            raise TransportError(
+                "Could not negotiate Pi desktop protocol 2. Deploy the latest agent and reconnect.",
+                code="incompatible_agent", input_state="not_started",
+            ) from exc
+
+    def request(
+        self, method: str, params: dict[str, Any] | None = None, *, deadline: float | None = None,
+    ) -> dict[str, Any]:
+        """One budget includes lock wait, hello, write and response; never retry inputs."""
+        budget_end = self._deadline(deadline)
+        if not self._lock.acquire(timeout=self._remaining(budget_end)):
+            # Another request owns the process; never discard it on lock timeout.
+            raise TransportError("SSH transport is busy; request timed out before starting", input_state="not_started")
+        try:
+            if self._remaining(budget_end) <= 0:
+                raise TransportError("SSH request timed out before starting", input_state="not_started")
+            if self._process is not None and self._process.poll() is not None:
+                self._discard()
+            if self._process is None:
+                self._start()
+                self._negotiate(budget_end)
+            if method == "hello":
+                assert self._hello is not None
+                return dict(self._hello)
             try:
-                self._write_request(self._process, wire)
-                response = self._responses.get(timeout=self.timeout)
-                if isinstance(response, BaseException):
-                    raise response
-                value = json.loads(response)
-                if not isinstance(value, dict) or value.get("id") != request_id:
-                    raise TransportError("SSH agent returned an invalid response id")
-                if "error" in value:
-                    error = value["error"]
-                    message = error.get("message") if isinstance(error, dict) else None
-                    raise TransportError(str(message or "remote agent error"))
-                result = value.get("result")
-                if not isinstance(result, dict):
-                    raise TransportError("SSH agent returned an invalid result")
-                return result
-            except queue.Empty as exc:
+                return self._exchange(method, params or {}, budget_end)
+            except RemoteAgentError:
+                # A well-formed rejection is safe to follow with another call.
+                raise
+            except TransportError:
                 self._discard()
-                raise TransportError(f"SSH agent timed out after {self.timeout:g} seconds") from exc
-            except (OSError, ValueError, TypeError, TransportError) as exc:
+                raise
+        finally:
+            self._lock.release()
+
+    def disconnect(self, *, deadline: float | None = None) -> dict[str, Any]:
+        """Release an existing session without opening a new SSH process."""
+        budget_end = self._deadline(deadline)
+        if not self._lock.acquire(timeout=self._remaining(budget_end)):
+            raise TransportError("SSH transport is busy; disconnect timed out before starting", input_state="not_started")
+        try:
+            if self._process is not None and self._process.poll() is not None:
                 self._discard()
-                if isinstance(exc, TransportError):
-                    raise
-                raise TransportError("SSH agent communication failed") from exc
+            if self._process is None:
+                return {"ok": True}
+            try:
+                return self._exchange("disconnect", {}, budget_end)
+            finally:
+                self._discard()
+        finally:
+            self._lock.release()
 
     def close(self) -> None:
         with self._lock:

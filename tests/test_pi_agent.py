@@ -1,5 +1,7 @@
 """Exercise RFB wire data and owned-session cleanup without a Pi desktop."""
 import base64
+import hashlib
+import importlib.util
 import io
 import json
 import os
@@ -171,6 +173,12 @@ class Session:
     def ensure(self):
         return self.client
 
+    def is_active(self):
+        return not self.closed
+
+    def check_geometry(self):
+        pass
+
     def close(self):
         self.closed = True
         self.client.close()
@@ -232,6 +240,19 @@ class InputTests(unittest.TestCase):
         self.desktop.dispatch("scroll", {"direction": "left", "ticks": 2})
         self.assertEqual(self.wire.sent, [self.pointer(10, 20), self.pointer(10, 20, 32), self.pointer(10, 20), self.pointer(10, 20, 32), self.pointer(10, 20)])
 
+    def test_first_scroll_requires_explicit_coordinates_without_starting_session(self):
+        with mock.patch.object(self.session, "ensure") as ensure:
+            with self.assertRaises(agent.AgentError) as error:
+                self.desktop.dispatch("scroll", {"direction": "down"})
+        self.assertEqual(error.exception.input_state, "not_started")
+        self.assertIn("x and y", str(error.exception))
+        ensure.assert_not_called()
+        self.assertEqual(self.wire.sent, [])
+
+    def test_first_targeted_scroll_moves_before_wheel_delivery(self):
+        self.desktop.dispatch("scroll", {"direction": "down", "ticks": 1, "x": 10, "y": 20})
+        self.assertEqual(self.wire.sent, [self.pointer(10, 20), self.pointer(10, 20, 16), self.pointer(10, 20)])
+
     def test_hotkey_releases_in_reverse_order(self):
         self.desktop.dispatch("key", {"keys": ["Control_L", "Alt_L", "F4"]})
         values = [0xffe3, 0xffe9, 0xffc1]
@@ -271,8 +292,9 @@ class InputTests(unittest.TestCase):
         with mock.patch.object(agent.shutil, "which", return_value="wtype"), \
              mock.patch.object(agent, "_wayland_environment", return_value=(environment, "/run/user/1000")), \
              mock.patch.object(agent.subprocess, "Popen", return_value=process) as spawn:
-            with self.assertRaisesRegex(agent.AgentError, "timed out.*partially"):
+            with self.assertRaisesRegex(agent.AgentError, "timed out.*partially") as error:
                 self.desktop.dispatch("type_text", {"text": "café"})
+        self.assertEqual(error.exception.input_state, "may_have_executed")
         self.assertEqual(spawn.call_count, 1)
         self.assertEqual(process.communicate.call_count, 1)
         process.terminate.assert_called_once()
@@ -312,8 +334,9 @@ class InputTests(unittest.TestCase):
 
     def test_mid_chord_failure_attempts_all_releases_and_closes_session(self):
         self.wire.fail_send = 2
-        with self.assertRaises(agent.AgentError):
+        with self.assertRaises(agent.AgentError) as error:
             self.desktop.dispatch("key", {"keys": ["Control_L", "a"]})
+        self.assertEqual(error.exception.input_state, "may_have_executed")
         self.assertEqual(self.wire.sent[-2:], [self.key(97, False), self.key(0xffe3, False)])
         self.assertTrue(self.session.closed)
 
@@ -372,6 +395,200 @@ class ServingTests(unittest.TestCase):
         agent.serve(self.desktop, io.StringIO("x" * (agent.MAX_REQUEST_BYTES + 1)), outgoing)
         self.assertIn("limit", json.loads(outgoing.getvalue())["error"]["message"])
         self.assertTrue(self.session.closed)
+
+
+class ProtocolV2Tests(unittest.TestCase):
+    setUp = InputTests.setUp
+
+    def test_hello_is_lease_free_and_advertises_protocol_and_capabilities(self):
+        with mock.patch.object(self.session, "ensure") as ensure, \
+             mock.patch.object(agent.subprocess, "Popen") as spawn:
+            result = self.desktop.dispatch("hello", {})
+        self.assertEqual(result["protocol_version"], 2)
+        self.assertEqual(result["agent_version"], "0.2.0")
+        self.assertRegex(result["agent_sha256"], r"^[0-9a-f]{64}$")
+        self.assertEqual(set(result["capabilities"]), {"hello", "health", "status", "screenshot", "move", "click", "drag", "scroll", "type_text", "key", "disconnect"})
+        ensure.assert_not_called()
+        spawn.assert_not_called()
+
+    def test_hash_identifies_loaded_source_even_after_on_disk_replacement(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(agent.__file__).read_bytes()
+            path = Path(directory) / "snapshot.py"
+            path.write_bytes(source)
+            spec = importlib.util.spec_from_file_location("snapshot_agent", path)
+            snapshot = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(snapshot)
+            path.write_bytes(source + b"\n# replaced after startup\n")
+            result = snapshot.DesktopAgent().dispatch("hello", {})
+            self.assertEqual(result["agent_sha256"], hashlib.sha256(source).hexdigest())
+            self.assertNotEqual(result["agent_sha256"], hashlib.sha256(path.read_bytes()).hexdigest())
+
+    def test_health_reports_missing_dependency_without_starting_or_leasing(self):
+        with mock.patch.object(self.session, "ensure") as ensure, \
+             mock.patch.object(agent.subprocess, "Popen") as spawn, \
+             mock.patch.object(agent.shutil, "which", side_effect=lambda name: None if name == "wtype" else "/usr/bin/" + name), \
+             mock.patch.object(agent, "_wayland_environment", return_value=({}, "/run/user/1000")):
+            result = self.desktop.dispatch("health", {})
+        self.assertFalse(result["desktop_ready"])
+        self.assertTrue(result["session_active"])
+        self.assertTrue(any(check["name"] == "wtype" and not check["ok"] for check in result["checks"]))
+        ensure.assert_not_called()
+        spawn.assert_not_called()
+
+    def test_health_reports_environment_failure_as_check_not_exception(self):
+        with mock.patch.object(agent.shutil, "which", return_value="present"), \
+             mock.patch.object(agent, "_wayland_environment", side_effect=agent.AgentError("No owned Wayland socket")):
+            result = self.desktop.dispatch("health", {})
+        self.assertFalse(result["desktop_ready"])
+        self.assertTrue(any(not check["ok"] and "Wayland" in check["message"] for check in result["checks"]))
+
+    def test_healthy_fresh_agent_never_acquires_desktop_lease(self):
+        desktop = agent.DesktopAgent()
+        with mock.patch.object(agent.shutil, "which", return_value="present"), \
+             mock.patch.object(agent, "_wayland_environment", return_value=({}, "/run/user/1000")), \
+             mock.patch.object(agent, "DesktopLease") as lease, \
+             mock.patch.object(agent.subprocess, "Popen") as spawn:
+            result = desktop.dispatch("health", {})
+            desktop.dispatch("hello", {})
+        self.assertTrue(result["desktop_ready"])
+        self.assertFalse(result["session_active"])
+        lease.assert_not_called()
+        spawn.assert_not_called()
+
+    def test_invalid_fresh_action_does_not_acquire_session(self):
+        session = mock.Mock()
+        session.is_active.return_value = False
+        desktop = agent.DesktopAgent(session)
+        cases = [("move", {"x": True, "y": 0}), ("click", {"x": 1, "y": 2, "button": "bad"}),
+                 ("key", {"keys": ["bad key"]}), ("type_text", {"text": "\0"}),
+                 ("scroll", {"direction": "down", "x": 4})]
+        for method, params in cases:
+            with self.subTest(method=method):
+                with self.assertRaises(agent.AgentError) as error:
+                    desktop.dispatch(method, params)
+                self.assertEqual(error.exception.code, "invalid_params")
+                self.assertEqual(error.exception.input_state, "not_started")
+        session.ensure.assert_not_called()
+
+    def test_fresh_coordinate_rejection_releases_new_session(self):
+        self.session.closed = True
+        with self.assertRaises(agent.AgentError) as error:
+            self.desktop.dispatch("move", {"x": 500, "y": 0})
+        self.assertEqual(error.exception.input_state, "not_started")
+        self.assertEqual(error.exception.code, "invalid_params")
+        self.assertTrue(self.wire.closed)
+        self.assertEqual(self.wire.sent, [])
+
+    def test_existing_session_survives_known_coordinate_rejection(self):
+        with self.assertRaises(agent.AgentError) as error:
+            self.desktop.dispatch("move", {"x": 500, "y": 0})
+        self.assertEqual(error.exception.input_state, "not_started")
+        self.assertFalse(self.session.closed)
+        self.assertFalse(self.wire.closed)
+
+    def test_rejected_action_releases_session_replaced_during_ensure(self):
+        self.desktop.client = self.client
+        fresh_wire = FragmentedSocket()
+        fresh_client = agent.RFBClient(fresh_wire)
+        fresh_client.width, fresh_client.height = 20, 10
+        def replace():
+            self.session.client = fresh_client
+            return fresh_client
+        with mock.patch.object(self.session, "ensure", side_effect=replace):
+            with self.assertRaises(agent.AgentError) as error:
+                self.desktop.dispatch("move", {"x": 50, "y": 30})
+        self.assertEqual(error.exception.input_state, "not_started")
+        self.assertTrue(fresh_wire.closed)
+        self.assertEqual(fresh_wire.sent, [])
+
+    def test_missing_typing_dependency_rejects_before_fresh_session(self):
+        with mock.patch.object(agent.shutil, "which", return_value=None), \
+             mock.patch.object(self.session, "ensure") as ensure:
+            with self.assertRaises(agent.AgentError) as error:
+                self.desktop.dispatch("type_text", {"text": "café"})
+        self.assertEqual((error.exception.code, error.exception.input_state), ("missing_dependency", "not_started"))
+        ensure.assert_not_called()
+        self.assertEqual(self.wire.sent, [])
+
+    def test_geometry_change_rejects_input_then_later_capture_can_reconnect(self):
+        failure = agent.AgentError("Desktop geometry changed", code="geometry_changed")
+        with mock.patch.object(self.session, "check_geometry", side_effect=failure):
+            with self.assertRaises(agent.AgentError) as error:
+                self.desktop.dispatch("click", {"x": 4, "y": 6})
+        self.assertEqual((error.exception.code, error.exception.input_state), ("geometry_changed", "not_started"))
+        self.assertEqual(self.wire.sent, [])
+        self.assertTrue(self.session.closed)
+        fresh_wire = FragmentedSocket(update(rectangle(0, 0, 20, 10, b"\0\0\xff\0" * 200)))
+        fresh_client = agent.RFBClient(fresh_wire)
+        fresh_client.width, fresh_client.height = 20, 10
+        fresh_client.frame = bytearray(20 * 10 * 4)
+        def reconnect():
+            self.session.client = fresh_client
+            self.session.closed = False
+            return fresh_client
+        with mock.patch.object(self.session, "ensure", side_effect=reconnect) as ensure:
+            result = self.desktop.dispatch("screenshot", {})
+        ensure.assert_called_once()
+        self.assertEqual((result["width"], result["height"]), (20, 10))
+        self.assertEqual(decode_png(base64.b64decode(result["image_base64"])), (20, 10, b"\xff\0\0" * 200))
+        self.assertFalse(fresh_wire.closed)
+
+    def test_each_input_checks_output_before_any_event_or_helper(self):
+        cases = [("move", {"x": 4, "y": 6}), ("click", {"x": 4, "y": 6}),
+                 ("drag", {"start_x": 4, "start_y": 6, "end_x": 8, "end_y": 9}),
+                 ("scroll", {"direction": "down", "x": 4, "y": 6}),
+                 ("key", {"keys": ["a"]}), ("type_text", {"text": "café"})]
+        for method, params in cases:
+            with self.subTest(method=method):
+                session = Session(self.client)
+                desktop = agent.DesktopAgent(session)
+                with mock.patch.object(session, "check_geometry", side_effect=agent.AgentError("changed", code="geometry_changed")), \
+                     mock.patch.object(agent.shutil, "which", return_value="wtype"), \
+                     mock.patch.object(agent.subprocess, "Popen") as spawn:
+                    with self.assertRaises(agent.AgentError) as error:
+                        desktop.dispatch(method, params)
+                self.assertEqual((error.exception.code, error.exception.input_state), ("geometry_changed", "not_started"))
+                spawn.assert_not_called()
+                self.assertEqual(self.wire.sent, [])
+
+    def test_helper_spawn_failure_is_not_started_and_does_not_retry(self):
+        environment = {"WAYLAND_DISPLAY": self.session.wayland_display}
+        with mock.patch.object(agent.shutil, "which", return_value="wtype"), \
+             mock.patch.object(agent, "_wayland_environment", return_value=(environment, "/run/user/1000")), \
+             mock.patch.object(agent.subprocess, "Popen", side_effect=FileNotFoundError("wtype disappeared")) as spawn:
+            with self.assertRaises(agent.AgentError) as error:
+                self.desktop.dispatch("type_text", {"text": "café"})
+        self.assertEqual(error.exception.input_state, "not_started")
+        spawn.assert_called_once()
+        self.assertTrue(self.session.closed)
+
+    def test_unexpected_key_failure_cleans_up_and_returns_conservative_safe_error(self):
+        with mock.patch.object(self.client, "key_event", side_effect=RuntimeError("private debug details")):
+            with self.assertRaises(agent.AgentError) as error:
+                self.desktop.dispatch("key", {"keys": ["Control_L", "a"]})
+        self.assertEqual((error.exception.code, error.exception.input_state), ("internal_error", "may_have_executed"))
+        self.assertNotIn("private", str(error.exception))
+        self.assertTrue(self.session.closed)
+        self.assertIsNone(self.desktop.client)
+        self.assertEqual(self.desktop.held_keys, [])
+
+    def test_failure_after_first_pointer_write_is_ambiguous_and_not_retried(self):
+        self.wire.fail_send = 1
+        with self.assertRaises(agent.AgentError) as error:
+            self.desktop.dispatch("move", {"x": 4, "y": 6})
+        self.assertEqual(error.exception.input_state, "may_have_executed")
+        self.assertEqual(len(self.wire.sent), 1)
+        self.assertTrue(self.session.closed)
+
+    def test_structured_error_envelope_recovers_for_following_hello(self):
+        requests = io.StringIO('{"id":1,"method":"move","params":{"x":true,"y":0}}\n{"id":2,"method":"hello","params":{}}\n')
+        output = io.StringIO()
+        agent.serve(self.desktop, requests, output)
+        rejection, success = map(json.loads, output.getvalue().splitlines())
+        self.assertEqual(set(rejection["error"]), {"code", "message", "input_state"})
+        self.assertEqual(rejection["error"]["input_state"], "not_started")
+        self.assertEqual(success["result"]["protocol_version"], 2)
 
 
 class LifecycleTests(unittest.TestCase):
@@ -540,7 +757,8 @@ class CompositorCaptureTests(unittest.TestCase):
 
     def test_private_control_response_selects_captured_output_without_newline(self):
         response = {"id": 1, "code": 0, "data": [
-            {"name": "HDMI-A-2", "captured": False}, {"name": "HDMI-A-1", "captured": True},
+            {"name": "HDMI-A-2", "captured": False},
+            {"name": "HDMI-A-1", "captured": True, "width": 2, "height": 1, "power": "ON"},
         ]}
         wire = FragmentedSocket(json.dumps(response).encode(), fragment=7)
         wire.connect = mock.Mock()
@@ -549,6 +767,92 @@ class CompositorCaptureTests(unittest.TestCase):
             self.assertEqual(self.session._select_output_name(), "HDMI-A-1")
         self.assertEqual(json.loads(wire.sent[0]), {"id": 1, "method": "output-list"})
         self.assertTrue(wire.closed)
+
+    def test_startup_waits_for_initial_unknown_power_metadata_before_selection(self):
+        initial = {"name": "HDMI-A-1", "width": 2, "height": 1, "captured": True}
+        wires = []
+        for power in ("UNKNOWN", "ON"):
+            wire = FragmentedSocket(json.dumps({"id": 1, "code": 0, "data": [{**initial, "power": power}]}).encode(), fragment=7)
+            wire.connect = mock.Mock()
+            wires.append(wire)
+        with mock.patch.object(agent.socket, "AF_UNIX", 1, create=True), \
+             mock.patch.object(agent.socket, "socket", side_effect=wires), \
+             mock.patch.object(agent.time, "sleep") as sleep:
+            self.assertEqual(self.session._select_output_name(), "HDMI-A-1")
+        self.assertEqual(self.session.output_geometry["power"], "ON")
+        self.assertTrue(all(wire.closed for wire in wires))
+        self.assertTrue(all(len(wire.sent) == 1 and json.loads(wire.sent[0])["method"] == "output-list" for wire in wires))
+        sleep.assert_called_once()
+
+    def test_startup_unknown_power_has_one_bounded_readiness_deadline(self):
+        unknown = {"name": "HDMI-A-1", "width": 2, "height": 1, "power": "UNKNOWN", "captured": True}
+        now = [0.0]
+        def advance(delay):
+            now[0] += delay
+        with mock.patch.object(self.session, "_query_selected_output", return_value=unknown) as query, \
+             mock.patch.object(agent, "IO_TIMEOUT", 0.05), \
+             mock.patch.object(agent.time, "monotonic", side_effect=lambda: now[0]), \
+             mock.patch.object(agent.time, "sleep", side_effect=advance):
+            with self.assertRaisesRegex(agent.AgentError, "power.*ready") as error:
+                self.session._select_output_name()
+        self.assertEqual(error.exception.input_state, "not_started")
+        self.assertIsNone(self.session.output_geometry)
+        self.assertLessEqual(now[0], 0.05)
+        self.assertLessEqual(query.call_count, 4)
+        self.assertTrue(all(call.kwargs.get("deadline") == 0.05 for call in query.call_args_list))
+
+    def test_preflight_rejects_changed_output_size_name_or_power_and_releases(self):
+        initial = {"name": "HDMI-A-1", "width": 2, "height": 1, "power": "ON", "captured": True}
+        self.session.output_geometry = initial
+        for changed in ({"width": 3}, {"height": 2}, {"name": "HDMI-A-2"}, {"power": "OFF"}, {"captured": False}):
+            with self.subTest(changed=changed):
+                with mock.patch.object(self.session, "_query_selected_output", return_value={**initial, **changed}, create=True), \
+                     mock.patch.object(self.session, "close") as close:
+                    with self.assertRaises(agent.AgentError) as error:
+                        self.session.check_geometry()
+                self.assertEqual((error.exception.code, error.exception.input_state), ("geometry_changed", "not_started"))
+                close.assert_called_once()
+
+    def test_preflight_accepts_unchanged_output_without_releasing(self):
+        initial = {"name": "HDMI-A-1", "width": 2, "height": 1, "power": "ON", "captured": True}
+        self.session.output_geometry = initial
+        with mock.patch.object(self.session, "_query_selected_output", return_value=initial.copy(), create=True), \
+             mock.patch.object(self.session, "close") as close:
+            self.session.check_geometry()
+        close.assert_not_called()
+
+    def test_missing_unpowered_or_malformed_control_geometry_rejects_input(self):
+        initial = {"name": "HDMI-A-1", "width": 2, "height": 1, "power": "ON", "captured": True}
+        self.session.output_geometry = initial
+        cases = [[], [{**initial, "captured": False}], [{**initial, "power": "OFF"}], [{**initial, "power": "UNKNOWN"}],
+                 [{**initial, "width": True}], [{**initial, "height": 0}],
+                 [{**initial, "width": 65535, "height": 65535}]]
+        for outputs in cases:
+            with self.subTest(outputs=outputs):
+                wire = FragmentedSocket(json.dumps({"id": 1, "code": 0, "data": outputs}).encode(), fragment=7)
+                wire.connect = mock.Mock()
+                with mock.patch.object(agent.socket, "AF_UNIX", 1, create=True), \
+                     mock.patch.object(agent.socket, "socket", return_value=wire), \
+                     mock.patch.object(self.session, "close") as close:
+                    with self.assertRaises(agent.AgentError) as error:
+                        self.session.check_geometry()
+                self.assertEqual((error.exception.code, error.exception.input_state), ("geometry_changed", "not_started"))
+                self.assertEqual(len(wire.sent), 1)
+                self.assertTrue(wire.closed)
+                close.assert_called_once()
+
+    def test_control_timeout_rejects_before_input_and_releases_session(self):
+        wire = FragmentedSocket()
+        wire.connect = mock.Mock()
+        wire.recv = mock.Mock(side_effect=socket.timeout())
+        with mock.patch.object(agent.socket, "AF_UNIX", 1, create=True), \
+             mock.patch.object(agent.socket, "socket", return_value=wire), \
+             mock.patch.object(self.session, "close") as close:
+            with self.assertRaises(agent.AgentError) as error:
+                self.session.check_geometry()
+        self.assertEqual((error.exception.code, error.exception.input_state), ("preflight_failed", "not_started"))
+        self.assertTrue(wire.closed)
+        close.assert_called_once()
 
 
 class LeaseTests(unittest.TestCase):

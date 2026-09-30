@@ -5,6 +5,7 @@ The owned WayVNC process exposes just one output of the logged-in Wayland user.
 """
 
 import base64
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -30,10 +31,22 @@ MAX_TEXT_BYTES = 1_048_576
 IO_TIMEOUT = 10.0
 MAX_REQUEST_BYTES = 65_536
 MAX_PNG_BYTES = MAX_PIXELS * 4 + MAX_TEXT_BYTES
+PROTOCOL_VERSION = 2
+AGENT_VERSION = "0.2.0"
+# Identify the source that this process loaded, even if deployment replaces it.
+AGENT_SHA256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
 
 
 class AgentError(Exception):
     """An expected operational or validation error, safe to return over stdio."""
+
+    def __init__(self, message, code="operation_failed", input_state="not_started"):
+        super().__init__(" ".join(str(message).split())[:1024])
+        self.code = code
+        self.input_state = input_state
+
+    def as_dict(self):
+        return {"code": self.code, "message": str(self), "input_state": self.input_state}
 
 
 def _dimensions(width, height):
@@ -248,7 +261,7 @@ class DesktopLease:
             try:
                 fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError as exc:
-                raise AgentError("Desktop is already controlled by another bridge session; disconnect that session first") from exc
+                raise AgentError("Desktop is already controlled by another bridge session; disconnect that session first", code="busy") from exc
         except BaseException as exc:
             self.close()
             if isinstance(exc, OSError):
@@ -272,6 +285,7 @@ class OwnedWayVNC:
         self.lease = None
         self.environment = None
         self.output_name = None
+        self.output_geometry = None
         self.capture_process = None
 
     def ensure(self):
@@ -282,7 +296,7 @@ class OwnedWayVNC:
         environment, runtime = _wayland_environment()
         executable = shutil.which("wayvnc")
         if not executable:
-            raise AgentError("wayvnc is not installed on the Pi")
+            raise AgentError("wayvnc is not installed on the Pi", code="missing_dependency")
         try:
             self.lease = DesktopLease(runtime)
             self.directory = Path(tempfile.mkdtemp(prefix="pi-desktop-", dir=runtime))
@@ -331,19 +345,41 @@ class OwnedWayVNC:
             raise
 
     def _select_output_name(self):
+        # WayVNC publishes ServerInit before its asynchronous output-power
+        # event arrives. UNKNOWN is a startup state, not permission to input.
+        deadline = time.monotonic() + IO_TIMEOUT
+        while True:
+            output = self._query_selected_output(deadline=deadline)
+            if (output["width"], output["height"]) != (self.client.width, self.client.height):
+                raise AgentError("WayVNC output dimensions differ from the input desktop; reconnect after display changes", code="geometry_changed")
+            if output["power"] == "ON":
+                self.output_geometry = output
+                return output["name"]
+            if output["power"] != "UNKNOWN":
+                raise AgentError("WayVNC captured output is not powered on", code="geometry_changed")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise AgentError("WayVNC output power did not become ready before the startup deadline", code="timeout")
+            time.sleep(min(0.02, remaining))
+
+    def _query_selected_output(self, deadline=None):
         """Query only our private control socket for the RFB pointer's output."""
         connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        deadline = time.monotonic() + IO_TIMEOUT
+        if deadline is None:
+            deadline = time.monotonic() + IO_TIMEOUT
+        def set_timeout():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise AgentError("WayVNC output query timed out")
+            connection.settimeout(remaining)
         try:
-            connection.settimeout(IO_TIMEOUT)
+            set_timeout()
             connection.connect(str(self.directory / "control.sock"))
+            set_timeout()
             connection.sendall(b'{"id":1,"method":"output-list"}')
             data = bytearray()
             while len(data) < MAX_REQUEST_BYTES:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise AgentError("WayVNC output query timed out")
-                connection.settimeout(remaining)
+                set_timeout()
                 block = connection.recv(min(4096, MAX_REQUEST_BYTES - len(data)))
                 if not block:
                     raise AgentError("WayVNC control socket closed before its output response")
@@ -358,11 +394,19 @@ class OwnedWayVNC:
                 outputs = response.get("data")
                 if not isinstance(outputs, list):
                     raise AgentError("WayVNC returned an invalid output list")
-                names = [item.get("name") for item in outputs if isinstance(item, dict) and item.get("captured") is True]
-                if (len(names) != 1 or not isinstance(names[0], str)
-                        or not 1 <= len(names[0]) <= 255 or "\0" in names[0]):
-                    raise AgentError("WayVNC did not identify exactly one captured output")
-                return names[0]
+                selected = [item for item in outputs if isinstance(item, dict) and item.get("captured") is True]
+                if len(selected) != 1:
+                    raise AgentError("WayVNC did not identify exactly one captured output", code="geometry_changed")
+                output = selected[0]
+                name, width, height = output.get("name"), output.get("width"), output.get("height")
+                if (not isinstance(name, str) or not 1 <= len(name) <= 255 or "\0" in name
+                        or type(width) is not int or type(height) is not int or output.get("power") not in ("ON", "OFF", "UNKNOWN")):
+                    raise AgentError("WayVNC captured output is unavailable or has invalid geometry", code="geometry_changed")
+                try:
+                    _dimensions(width, height)
+                except AgentError as exc:
+                    raise AgentError("WayVNC captured output dimensions are invalid or exceed 16 megapixels", code="geometry_changed") from exc
+                return {"name": name, "width": width, "height": height, "power": output["power"], "captured": True}
             raise AgentError("WayVNC output response exceeds the byte limit")
         except socket.timeout as exc:
             raise AgentError("WayVNC output query timed out") from exc
@@ -370,6 +414,18 @@ class OwnedWayVNC:
             raise AgentError("WayVNC output query failed: " + str(exc)) from exc
         finally:
             connection.close()
+
+    def check_geometry(self):
+        """Reject stale input coordinates before sending any desktop events."""
+        try:
+            current = self._query_selected_output()
+            if self.output_geometry is None or current != self.output_geometry:
+                raise AgentError("Desktop output changed; take a fresh screenshot before sending more input", code="geometry_changed")
+        except AgentError as exc:
+            if exc.code == "operation_failed":
+                exc.code = "preflight_failed"
+            self.close()
+            raise
 
     def _stop_capture(self):
         if self.capture_process is None:
@@ -390,7 +446,7 @@ class OwnedWayVNC:
         """Capture the actual compositor output, never WayVNC's cached frame."""
         executable = shutil.which("grim")
         if not executable:
-            raise AgentError("Install the grim package on the Pi to capture its desktop")
+            raise AgentError("Install the grim package on the Pi to capture its desktop", code="missing_dependency")
         # An anonymous private file keeps subprocess output out of stdout and
         # avoids an unbounded in-memory communicate() result before size checks.
         with tempfile.TemporaryFile(dir=self.directory) as output:
@@ -414,7 +470,7 @@ class OwnedWayVNC:
                 width, height = struct.unpack("!II", header[16:24])
                 _dimensions(width, height)
                 if (width, height) != (self.client.width, self.client.height):
-                    raise AgentError("Compositor screenshot dimensions differ from the input desktop; reconnect after display changes")
+                    raise AgentError("Compositor screenshot dimensions differ from the input desktop; reconnect after display changes", code="geometry_changed")
                 data = header + output.read(MAX_PNG_BYTES - len(header) + 1)
                 if not data.endswith(b"\0\0\0\0IEND\xaeB`\x82"):
                     raise AgentError("grim returned an incomplete PNG")
@@ -460,6 +516,13 @@ class OwnedWayVNC:
         if self.lease is not None:
             self.lease.close()
             self.lease = None
+        self.output_name = None
+        self.output_geometry = None
+        self.wayland_display = None
+        self.environment = None
+
+    def is_active(self):
+        return self.client is not None and self.process is not None and self.process.poll() is None
 
 
 KEYSYMS = {
@@ -474,16 +537,18 @@ KEYSYMS = {
 BUTTONS = {"left": 1, "middle": 2, "right": 4}
 WHEEL = {"up": 8, "down": 16, "left": 32, "right": 64}
 PARAMETERS = {
+    "hello": set(), "health": set(),
     "status": set(), "screenshot": set(), "disconnect": set(),
     "move": {"x", "y"}, "click": {"x", "y", "button", "count"},
     "drag": {"start_x", "start_y", "end_x", "end_y", "button", "steps"},
     "scroll": {"x", "y", "direction", "ticks"}, "type_text": {"text"}, "key": {"keys"},
 }
+INPUT_METHODS = frozenset({"move", "click", "drag", "scroll", "type_text", "key"})
 
 
 def _integer(value, name, minimum, maximum):
     if type(value) is not int or not minimum <= value <= maximum:
-        raise AgentError("%s must be an integer from %d to %d" % (name, minimum, maximum))
+        raise AgentError("%s must be an integer from %d to %d" % (name, minimum, maximum), code="invalid_params")
     return value
 
 
@@ -493,7 +558,7 @@ def _character_keysym(value):
     if value == "\t":
         return KEYSYMS["Tab"]
     if not value.isprintable() or 0xd800 <= ord(value) <= 0xdfff:
-        raise AgentError("Text contains an unsupported control character")
+        raise AgentError("Text contains an unsupported control character", code="invalid_params")
     codepoint = ord(value)
     return codepoint if codepoint <= 255 else 0x01000000 | codepoint
 
@@ -502,17 +567,19 @@ class DesktopAgent:
     def __init__(self, session=None):
         self.session = session if session is not None else OwnedWayVNC()
         self.client = None
-        self.position = (0, 0)
+        self.position = None
         self.held_keys = []
         self.pointer_held = False
         self.typing_process = None
+        self.input_started = False
 
     def _coordinates(self, params, x="x", y="y"):
-        return (_integer(params.get(x), x, 0, self.client.width - 1),
-                _integer(params.get(y), y, 0, self.client.height - 1))
+        return (_integer(params.get(x), x, 0, 65535),
+                _integer(params.get(y), y, 0, 65535))
 
     def _pointer(self, position, mask=0):
         # Track before send: sendall can fail after the peer received the event.
+        self.input_started = True
         self.position = position
         if mask:
             self.pointer_held = True
@@ -547,6 +614,7 @@ class DesktopAgent:
         try:
             for value in values:
                 self.held_keys.append(value)
+                self.input_started = True
                 self.client.key_event(value, True)
         finally:
             self._release()
@@ -568,13 +636,10 @@ class DesktopAgent:
                 process.stdin.close()
             self.typing_process = None
 
-    def _type_text(self, text):
-        executable = shutil.which("wtype")
-        if not executable:
-            raise AgentError("Install the wtype package on the Pi to enable reliable Unicode text input")
+    def _type_text(self, text, executable):
         environment, _ = _wayland_environment()
         if environment["WAYLAND_DISPLAY"] != self.session.wayland_display:
-            raise AgentError("Wayland display changed; disconnect and reconnect before typing")
+            raise AgentError("Wayland display changed; disconnect and reconnect before typing", code="geometry_changed")
         # wtype decodes stdin using the locale; an SSH session may otherwise use C.
         environment["LC_ALL"] = "C.UTF-8"
         try:
@@ -583,73 +648,127 @@ class DesktopAgent:
                 stdout=subprocess.DEVNULL, stderr=sys.stderr, env=environment,
                 close_fds=True, start_new_session=True, umask=0o077,
             )
+            self.input_started = True
             self.typing_process.communicate(text.encode("utf-8"), timeout=8 + len(text) * 0.008)
             if self.typing_process.returncode:
-                raise AgentError("wtype failed; text may have been partially typed. Inspect the desktop before retrying")
+                raise AgentError("wtype failed; text may have been partially typed. Inspect the desktop before retrying", code="input_failed")
         except subprocess.TimeoutExpired as exc:
-            raise AgentError("wtype timed out; text may have been partially typed. Inspect the desktop before retrying") from exc
+            raise AgentError("wtype timed out; text may have been partially typed. Inspect the desktop before retrying", code="timeout") from exc
         except OSError as exc:
-            raise AgentError("wtype failed; text may have been partially typed: " + str(exc)) from exc
+            raise AgentError("wtype failed: " + str(exc), code="input_failed") from exc
         finally:
             self._stop_typing()
 
-    def dispatch(self, method, params):
+    def _prepare(self, method, params):
+        """Reject malformed actions before any desktop session is acquired."""
         if not isinstance(method, str) or method not in PARAMETERS:
-            raise AgentError("Unknown desktop method")
+            raise AgentError("Unknown desktop method", code="unknown_method")
         if not isinstance(params, dict) or any(key not in PARAMETERS[method] for key in params):
-            raise AgentError("Invalid parameters for " + method)
-        if method == "disconnect":
-            self.close()
-            return {"ok": True}
-        self.client = self.session.ensure()
-        # Validate an entire action before emitting any event.
+            raise AgentError("Invalid parameters for " + method, code="invalid_params")
+        prepared = {}
         if method in ("move", "click"):
-            position = self._coordinates(params)
+            prepared["position"] = self._coordinates(params)
         if method in ("click", "drag"):
             button = params.get("button", "left")
             if not isinstance(button, str) or button not in BUTTONS:
-                raise AgentError("button must be left, middle, or right")
-            mask = BUTTONS[button]
+                raise AgentError("button must be left, middle, or right", code="invalid_params")
+            prepared["mask"] = BUTTONS[button]
         if method == "click":
-            count = _integer(params.get("count", 1), "count", 1, 2)
+            prepared["count"] = _integer(params.get("count", 1), "count", 1, 2)
         elif method == "drag":
-            start = self._coordinates(params, "start_x", "start_y")
-            end = self._coordinates(params, "end_x", "end_y")
-            steps = _integer(params.get("steps", 20), "steps", 1, 200)
+            prepared["start"] = self._coordinates(params, "start_x", "start_y")
+            prepared["end"] = self._coordinates(params, "end_x", "end_y")
+            prepared["steps"] = _integer(params.get("steps", 20), "steps", 1, 200)
         elif method == "scroll":
             direction = params.get("direction")
             if not isinstance(direction, str) or direction not in WHEEL:
-                raise AgentError("direction must be up, down, left, or right")
-            mask = WHEEL[direction]
-            count = _integer(params.get("ticks", 1), "ticks", 1, 50)
-            position = self._coordinates(params) if "x" in params or "y" in params else self.position
-            _integer(position[0], "x", 0, self.client.width - 1)
-            _integer(position[1], "y", 0, self.client.height - 1)
+                raise AgentError("direction must be up, down, left, or right", code="invalid_params")
+            prepared["mask"] = WHEEL[direction]
+            prepared["count"] = _integer(params.get("ticks", 1), "ticks", 1, 50)
+            if ("x" in params) != ("y" in params):
+                raise AgentError("Provide both x and y for a targeted scroll", code="invalid_params")
+            prepared["targeted"] = "x" in params
+            prepared["position"] = self._coordinates(params) if prepared["targeted"] else self.position
+            if prepared["position"] is None:
+                raise AgentError("Provide x and y for the first scroll, or move to a visible target first", code="invalid_params")
         elif method == "type_text":
             value = params.get("text")
             if not isinstance(value, str) or len(value) > 4096:
-                raise AgentError("text must be a string of at most 4096 characters")
+                raise AgentError("text must be a string of at most 4096 characters", code="invalid_params")
             text = value.replace("\r\n", "\n").replace("\r", "\n")
             for char in text:
                 _character_keysym(char)  # Validate all text before starting wtype.
+            prepared["text"] = text
+            prepared["executable"] = shutil.which("wtype")
+            if not prepared["executable"]:
+                raise AgentError("Install the wtype package on the Pi to enable reliable Unicode text input", code="missing_dependency")
         elif method == "key":
             keys = params.get("keys")
             if not isinstance(keys, list) or not 1 <= len(keys) <= 8:
-                raise AgentError("keys must be a list of 1 to 8 key names")
+                raise AgentError("keys must be a list of 1 to 8 key names", code="invalid_params")
             values = []
             for key in keys:
                 if not isinstance(key, str):
-                    raise AgentError("Each key must be a named key or printable character")
+                    raise AgentError("Each key must be a named key or printable character", code="invalid_params")
                 if key in KEYSYMS:
                     value = KEYSYMS[key]
                 elif len(key) == 1 and key.isprintable():
                     value = _character_keysym(key)
                 else:
-                    raise AgentError("Unknown key name")
+                    raise AgentError("Unknown key name", code="invalid_params")
                 if value in values:
-                    raise AgentError("A key chord cannot contain duplicate keys")
+                    raise AgentError("A key chord cannot contain duplicate keys", code="invalid_params")
                 values.append(value)
+            prepared["keys"] = values
+        return prepared
+
+    def _hello(self):
+        return {"protocol_version": PROTOCOL_VERSION, "agent_version": AGENT_VERSION,
+                "agent_sha256": AGENT_SHA256, "capabilities": list(PARAMETERS)}
+
+    def _health(self):
+        checks = [{"name": "python", "ok": sys.version_info >= (3, 11),
+                   "message": "Python 3.11 or newer is required"}]
+        for name in ("wayvnc", "grim", "wtype"):
+            found = shutil.which(name) is not None
+            checks.append({"name": name, "ok": found,
+                           "message": name + " is available" if found else "Install the " + name + " package on the Pi"})
         try:
+            _wayland_environment()
+            checks.append({"name": "wayland", "ok": True,
+                           "message": "Private runtime directory and owned Wayland socket are available"})
+        except AgentError as exc:
+            checks.append({"name": "wayland", "ok": False, "message": str(exc)})
+        return {**self._hello(), "desktop_ready": all(check["ok"] for check in checks),
+                "session_active": self.session.is_active(), "checks": checks}
+
+    def dispatch(self, method, params):
+        self.input_started = False
+        was_active = False
+        try:
+            was_active = self.session.is_active()
+            prepared = self._prepare(method, params)
+            if method == "hello":
+                return self._hello()
+            if method == "health":
+                return self._health()
+            if method == "disconnect":
+                self.close()
+                return {"ok": True}
+            previous_client = self.client
+            self.client = self.session.ensure()
+            if previous_client is not None and self.client is not previous_client:
+                was_active = False  # A replacement lease must not survive a rejected action.
+                self.position = None
+                if method == "scroll" and not prepared["targeted"]:
+                    raise AgentError("Provide x and y after reconnecting the desktop session", code="invalid_params")
+            if method in INPUT_METHODS:
+                self.session.check_geometry()
+            for key in ("position", "start", "end"):
+                if key in prepared:
+                    x, y = prepared[key]
+                    _integer(x, "x", 0, self.client.width - 1)
+                    _integer(y, "y", 0, self.client.height - 1)
             if method == "status":
                 return {"hostname": socket.gethostname(), "width": self.client.width,
                         "height": self.client.height, "desktop_name": self.client.name,
@@ -659,9 +778,10 @@ class DesktopAgent:
                 return {"image_base64": base64.b64encode(png).decode("ascii"),
                         "mime_type": "image/png", "width": self.client.width, "height": self.client.height}
             if method == "move":
-                self._pointer(position)
+                self._pointer(prepared["position"])
             elif method in ("click", "scroll"):
-                if method == "click":
+                position, mask, count = prepared["position"], prepared["mask"], prepared["count"]
+                if method == "click" or prepared["targeted"]:
                     self._move_before_press(position)
                 for index in range(count):
                     try:
@@ -671,6 +791,8 @@ class DesktopAgent:
                     if method == "click" and index + 1 < count:
                         time.sleep(0.08)
             elif method == "drag":
+                start, end = prepared["start"], prepared["end"]
+                mask, steps = prepared["mask"], prepared["steps"]
                 self._move_before_press(start)
                 try:
                     self._pointer(start, mask)
@@ -681,14 +803,25 @@ class DesktopAgent:
                 finally:
                     self._release()
             elif method == "type_text":
-                self._type_text(text)
+                self._type_text(prepared["text"], prepared["executable"])
             elif method == "key":
-                self._chord(values)
+                self._chord(prepared["keys"])
             return {"ok": True}
-        except BaseException:
-            # A partially read frame cannot safely be reused, and a failed input
-            # may have reached the compositor. Closing removes our virtual devices.
+        except AgentError as exc:
+            if self.input_started:
+                exc.input_state = "may_have_executed"
+                if exc.code == "operation_failed":
+                    exc.code = "input_failed"
+            preserve = was_active and not self.input_started and exc.code in {
+                "invalid_params", "unknown_method", "missing_dependency"}
+            if not preserve:
+                self.close()
+            raise
+        except BaseException as exc:
             self.close()
+            if isinstance(exc, Exception):
+                raise AgentError("Unexpected desktop failure; inspect the desktop before retrying",
+                                 code="internal_error", input_state="may_have_executed") from exc
             raise
 
     def close(self):
@@ -697,13 +830,18 @@ class DesktopAgent:
                 self._stop_typing()
             finally:
                 self._release()
-        except (AgentError, OSError):
-            pass
+        except Exception as exc:
+            print("pi-desktop-agent input cleanup: " + type(exc).__name__, file=sys.stderr)
         finally:
-            self.session.close()
-            self.client = None
-            self.held_keys.clear()
-            self.pointer_held = False
+            try:
+                self.session.close()
+            except Exception as exc:
+                print("pi-desktop-agent session cleanup: " + type(exc).__name__, file=sys.stderr)
+            finally:
+                self.client = None
+                self.held_keys.clear()
+                self.pointer_held = False
+                self.position = None
 
 
 def serve(desktop, incoming, outgoing):
@@ -718,25 +856,26 @@ def serve(desktop, incoming, outgoing):
             oversized = len(line.encode("utf-8")) > MAX_REQUEST_BYTES
             try:
                 if oversized:
-                    raise AgentError("Request exceeds the byte limit")
+                    raise AgentError("Request exceeds the byte limit", code="invalid_request")
                 try:
                     request = json.loads(line)
                 except (ValueError, RecursionError) as exc:
-                    raise AgentError("Request must be valid JSON") from exc
+                    raise AgentError("Request must be valid JSON", code="invalid_request") from exc
                 if not isinstance(request, dict) or type(request.get("id")) is not int:
-                    raise AgentError("Request id must be an integer")
+                    raise AgentError("Request id must be an integer", code="invalid_request")
                 request_id = request["id"]
                 if set(request) != {"id", "method", "params"}:
-                    raise AgentError("Request requires id, method, and params")
+                    raise AgentError("Request requires id, method, and params", code="invalid_request")
                 result = desktop.dispatch(request["method"], request["params"])
                 response = {"id": request_id, "result": result}
                 disconnect = request["method"] == "disconnect"
             except AgentError as exc:
-                response = {"id": request_id, "error": {"message": str(exc)[:1024]}}
+                response = {"id": request_id, "error": exc.as_dict()}
             except Exception as exc:
-                print("pi-desktop-agent: " + str(exc), file=sys.stderr)
+                print("pi-desktop-agent: unexpected " + type(exc).__name__, file=sys.stderr)
                 desktop.close()
-                response = {"id": request_id, "error": {"message": "Desktop operation failed"}}
+                response = {"id": request_id, "error": AgentError("Desktop operation failed",
+                            code="internal_error", input_state="may_have_executed").as_dict()}
             outgoing.write(json.dumps(response, ensure_ascii=True, separators=(",", ":")) + "\n")
             outgoing.flush()
             if disconnect or oversized:

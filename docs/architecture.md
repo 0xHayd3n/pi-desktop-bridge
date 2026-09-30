@@ -14,9 +14,17 @@ Existing Raspberry Pi Wayland desktop
 
 The local server uses the official Python MCP SDK. A single persistent SSH process carries requests and responses. Input and the resulting screenshot run under one lock so concurrent tools cannot interleave a keyboard chord or a drag. Failed input is never automatically replayed: a connection can fail after an action was already applied.
 
+Protocol version 2 starts each SSH connection with a lease-free `hello` exchange. It advertises the agent version, source hash and supported methods. Incompatible agents are rejected before desktop operations with deployment guidance. `health` checks prerequisites without initializing WayVNC. The source hash is captured when the agent process loads so a running old process does not report newly deployed on-disk code as its own.
+
+Remote errors carry a stable code and an input state. A preflight rejection is distinct from uncertain delivery. The MCP server requires a fresh successful screenshot after uncertainty or an acknowledged action with failed capture. These errors do not trigger a replay. Valid preflight errors preserve a healthy SSH connection; malformed protocol responses invalidate it.
+
+Each tool enters asynchronously and shares a monotonic deadline across queueing, negotiation, writing, reading and post-action capture. Only the serialization lock owner starts a blocking SSH worker. A cancelled or expired waiter cannot deliver input later or stop another caller's active process. Cancellation after work starts retains the lock through completion and bounded cleanup; cancelled input requires a new screenshot even if its background capture succeeded. A cancelled screenshot does not clear an existing observation requirement. All observation, action and release tools use the same serialization lock.
+
 The Pi agent uses Python's standard library, WayVNC, `grim` and `wtype`. It takes an exclusive per-user runtime lease before starting its owned WayVNC process, preventing independent bridge clients from interleaving input. It creates a private directory under the user's runtime directory and communicates using RFB over a UNIX socket. It does not expose an HTTP, WebSocket or VNC network listener. `grim` captures a fresh PNG directly from the compositor on the selected output, avoiding WayVNC's initial placeholder and cached framebuffer. `wtype` sends Unicode text using a virtual Wayland keyboard; text goes through stdin, not shell arguments, and the clipboard is not changed.
 
 The zero-byte lease file persists in the runtime directory to avoid races caused by replacing its inode. The kernel releases the file lock when the owning agent closes or exits. It is not a daemon or a permanent background service.
+
+The explicit disconnect tool closes the bridge's SSH agent and owned desktop processes while leaving the MCP server available for lazy reconnection. Invalid first actions release any session acquired for bounds checking. Input preflight queries the private WayVNC control socket to check output identity and dimensions before events are sent. Scroll targets use original screenshot coordinates; an unknown initial pointer position is never substituted with `(0, 0)`.
 
 The desktop must already be running under the SSH user. This controls the Pi's graphical session; it does not capture or control another computer connected to the Pi's HDMI port. SSH keys remain in OpenSSH's normal store. Deploying the agent needs no root access and does not alter system services or firewall rules.
 

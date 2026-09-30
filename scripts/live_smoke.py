@@ -12,6 +12,7 @@ import time
 
 from mcp import ClientSession, types
 from mcp.client.stdio import StdioServerParameters, stdio_client
+from pi_desktop_bridge.transport import SSHTransport
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -118,13 +119,14 @@ async def exercise(host, output):
             async with ClientSession(*streams) as session:
                 await session.initialize()
                 report["tools"] = [tool.name for tool in (await session.list_tools()).tools]
+                assert len(report["tools"]) == 10, report["tools"]
 
                 async def call(name, arguments=None, image_name=None):
                     result = await session.call_tool(name, arguments or {})
                     if result.isError:
                         raise RuntimeError(str(result.content))
                     images = [item for item in result.content if isinstance(item, types.ImageContent)]
-                    if name != "desktop_status" and not images:
+                    if name not in {"desktop_status", "desktop_health", "desktop_disconnect"} and not images:
                         raise RuntimeError(f"{name} did not return a model-visible screenshot")
                     if image_name:
                         data = base64.b64decode(images[0].data, validate=True)
@@ -133,10 +135,36 @@ async def exercise(host, output):
                         (output / image_name).write_bytes(data)
                     return result
 
+                def json_content(result):
+                    texts = [item.text for item in result.content if isinstance(item, types.TextContent)]
+                    assert texts, result
+                    return json.loads(texts[0])
+
+                def another_client_can_acquire():
+                    with SSHTransport(host) as transport:
+                        return transport.request("status")
+
+                health = json_content(await call("desktop_health"))
+                assert health["desktop_ready"] and health["protocol_version"] == 2, health
+                assert health["session_active"] is False, health
+                report["checks"]["lease_free_health"] = True
+                rejected = await session.call_tool("desktop_click", {"x": 0, "y": 0, "button": "invalid"})
+                assert rejected.isError, rejected
+                error = " ".join(item.text for item in rejected.content if isinstance(item, types.TextContent))
+                assert "button" in error and "may have executed" not in error, error
+                assert json_content(await call("desktop_health"))["session_active"] is False
+                await asyncio.to_thread(another_client_can_acquire)
+                report["checks"]["rejected_first_input_releases_desktop"] = True
+
                 await call("desktop_status")
                 report["checks"]["mcp_initialize_status"] = True
                 await call("desktop_screenshot", image_name="before.png")
                 report["checks"]["model_visible_image"] = True
+                assert json_content(await call("desktop_health"))["session_active"] is True
+                rejected = await session.call_tool("desktop_click", {"x": 0, "y": 0, "count": 9})
+                assert rejected.isError
+                assert json_content(await call("desktop_health"))["session_active"] is True
+                report["checks"]["validation_error_keeps_session"] = True
                 geometry = fixture["state"]["geometry"]
 
                 def center(name):
@@ -163,11 +191,15 @@ async def exercise(host, output):
                                                 {"hotkeys": 1, "text": "Screenshot and input verified"})
                 assert state["hotkeys"] == 1 and state["text"] == "Screenshot and input verified", state
                 report["checks"]["hotkey"] = True
-                await call("desktop_move", center("canvas"))
-                await call("desktop_scroll", {"direction": "down", "ticks": 2})
+                await call("desktop_disconnect")
+                await call("desktop_disconnect")  # Idempotent; should not start another agent.
+                await asyncio.to_thread(another_client_can_acquire)
+                report["checks"]["release_allows_another_client"] = True
+                await call("desktop_scroll", {"direction": "down", "ticks": 2, **center("canvas")})
                 state = await asyncio.to_thread(wait_for_state, host, fixture, {"scrolls": 2})
                 assert state["scrolls"] == 2, state
                 report["checks"]["scroll"] = True
+                report["checks"]["targeted_first_scroll_after_reconnect"] = True
                 canvas = geometry["canvas"]
                 await call("desktop_drag", {
                     "start_x": canvas["x"] + 60, "start_y": canvas["y"] + 65,

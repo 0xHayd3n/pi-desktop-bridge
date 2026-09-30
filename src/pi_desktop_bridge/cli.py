@@ -8,10 +8,12 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shlex
 import subprocess
 import sys
 
+from . import PROTOCOL_VERSION, __version__
 from .server import create_server
 from .transport import SSHTransport, TransportError, _ssh_environment, ssh_argv, validate_host
 
@@ -71,10 +73,64 @@ def deploy(host: str) -> str:
     return expected
 
 
+def doctor(host: str) -> dict:
+    """Check the deployed agent and desktop prerequisites without taking control."""
+    validate_host(host)
+    expected = hashlib.sha256(Path(__file__).with_name("pi_agent.py").read_bytes()).hexdigest()
+    report = {
+        "host": host, "client_version": __version__, "protocol_version": PROTOCOL_VERSION,
+        "ready": False, "scope": "prerequisites", "checks": [], "next_steps": [],
+    }
+    try:
+        with SSHTransport(host) as transport:
+            health = transport.request("health")
+    except (TransportError, OSError) as exc:
+        # Do not dump SSH stderr, environment values or arbitrary child output.
+        message = str(exc) if isinstance(exc, TransportError) else "The SSH client could not be started"
+        report["checks"] = [{"name": "connection", "ok": False, "message": message[:1024]}]
+        report["next_steps"] = [
+            "Verify the SSH alias, trusted host key and password-free login in a normal terminal.",
+            f"Deploy the current agent with pi-desktop-bridge deploy --host {host}, then reconnect.",
+        ]
+        return report
+    if not isinstance(health, dict):
+        health = {}
+    checks = health.get("checks")
+    digest = health.get("agent_sha256")
+    if (type(health.get("desktop_ready")) is not bool
+            or health.get("protocol_version") != PROTOCOL_VERSION
+            or not isinstance(health.get("agent_version"), str) or len(health["agent_version"]) > 64
+            or not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+            or not isinstance(checks, list) or len(checks) > 32
+            or any(not isinstance(check, dict) or not isinstance(check.get("name"), str)
+                   or type(check.get("ok")) is not bool or not isinstance(check.get("message"), str)
+                   for check in checks)):
+        report["checks"] = [{"name": "agent_health", "ok": False,
+                             "message": "The agent returned invalid health diagnostics"}]
+        report["next_steps"] = [f"Deploy the current agent with pi-desktop-bridge deploy --host {host}, then reconnect."]
+        return report
+    matches = digest == expected
+    report.update({
+        "agent_version": health["agent_version"], "agent_sha256": digest,
+        "agent_matches_client": matches, "desktop_ready": health["desktop_ready"],
+        "session_active": health.get("session_active") is True,
+        "checks": [{"name": check["name"][:128], "ok": check["ok"], "message": check["message"][:1024]}
+                   for check in checks] + [{"name": "agent_source", "ok": matches,
+                                           "message": "Deployed source matches this client" if matches else
+                                           "Deployed source differs from this client; deploy and reconnect"}],
+    })
+    report["ready"] = matches and health["desktop_ready"] and all(check["ok"] for check in checks)
+    if not matches:
+        report["next_steps"].append(f"Deploy the current agent with pi-desktop-bridge deploy --host {host}, then reconnect.")
+    if not health["desktop_ready"] or not all(check["ok"] for check in checks):
+        report["next_steps"].append("Resolve the failed prerequisite checks under the Pi's desktop user, then rerun doctor.")
+    return report
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Raspberry Pi desktop bridge over SSH")
     subparsers = parser.add_subparsers(dest="command", required=True)
-    for name in ("serve", "deploy", "status", "screenshot"):
+    for name in ("serve", "deploy", "doctor", "status", "screenshot"):
         sub = subparsers.add_parser(name)
         sub.add_argument(
             "--host", default=os.environ.get("PI_DESKTOP_SSH_HOST", "pi-desktop"),
@@ -92,6 +148,10 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "deploy":
             checksum = deploy(args.host)
             print(f"Deployed Pi agent to {args.host}; SHA-256 {checksum}")
+        elif args.command == "doctor":
+            report = doctor(args.host)
+            print(json.dumps(report, ensure_ascii=False, indent=2))
+            return 0 if report["ready"] else 1
         elif args.command == "serve":
             with SSHTransport(args.host) as transport:
                 create_server(args.host, transport=transport).run(transport="stdio")

@@ -21,10 +21,13 @@ Clone this repository and run these commands from its directory:
 ```sh
 uv sync --frozen
 uv run pi-desktop-bridge deploy --host pi-desktop
+uv run pi-desktop-bridge doctor --host pi-desktop
 uv run pi-desktop-bridge status --host pi-desktop
 ```
 
 `pi-desktop` is an example SSH alias. Substitute your working alias, or create a concrete `Host pi-desktop` entry in your SSH config. The deployment copies the agent into `~/.local/share/pi-desktop-bridge` under the SSH user, checks the file's SHA-256, and needs no `sudo`.
+
+`doctor` reports SSH/agent compatibility, source consistency, required tools and the desktop user's Wayland environment as JSON. It exits with status 1 when a check fails and includes next steps. It checks prerequisites without taking the desktop lease; it does not reserve the desktop, guarantee a capture, or prove an off-network VPN route.
 
 For Codex, add the server using the Python executable inside this repository's `.venv`:
 
@@ -54,18 +57,30 @@ This is a configuration example, not a universal IDE extension. The client must 
 
 | Tool | Operation |
 | --- | --- |
+| `desktop_health` | Check agent and desktop prerequisites without taking control |
 | `desktop_status` | Desktop size and connection information |
 | `desktop_screenshot` | Current PNG screenshot |
 | `desktop_move` | Move to absolute screenshot pixel coordinates |
 | `desktop_click` | Left, middle or right click; single or double |
 | `desktop_drag` | Drag between two screenshot coordinates |
-| `desktop_scroll` | Scroll up, down, left or right |
+| `desktop_scroll` | Scroll up, down, left or right at an explicit `x`, `y` target |
 | `desktop_type` | Type text into the focused app |
 | `desktop_key` | Press a key or shortcut, for example `["Control_L", "a"]` |
+| `desktop_disconnect` | Release the desktop; the next observation reconnects |
 
 Coordinates use the original screenshot's dimensions and top-left origin. Take a screenshot before choosing a target. The tools operate the active desktop, so a local person moving focus can change where subsequent input goes. Keyboard behavior depends on the target app and compositor; the live verification checks the actual Pi rather than inferring behavior from protocol messages.
 
+For scrolling, pass both `x` and `y` inside the visible pane. Omitting them uses the last position moved by this bridge; a new connection rejects an untargeted scroll rather than guessing a position. Before sending input, the agent verifies that the captured output and its dimensions still match the input session. A changed display rejects the action before delivery; take a new screenshot to reconnect with its current geometry.
+
 Only one bridge session can control a desktop user at a time. A second client receives a busy error until the first client closes its bridge connection. This prevents separate assistants from interleaving input. Text is delivered through `wtype`'s virtual keyboard without replacing the clipboard. Screenshots use `grim` to capture the compositor directly, avoiding WayVNC's startup placeholder and cached frames.
+
+Call `desktop_disconnect` when finished so another client can use the Pi without restarting the MCP server. The call is idempotent. A fresh screenshot opens a new SSH/desktop session when needed.
+
+The client checks protocol compatibility before its first operation on each SSH connection. Update the repo, run `uv sync --frozen`, deploy the agent again and restart the MCP server when upgrading. A compatible protocol alone does not prove that the deployed source is current; `doctor` also compares its SHA-256.
+
+Validation and prerequisite errors explain what was rejected and confirm that input did not start. If delivery becomes uncertain, or input was acknowledged but its resulting image could not be captured, further input is blocked until `desktop_screenshot` succeeds. Input is never automatically replayed. Health, status and disconnect do not clear this observation requirement.
+
+Each MCP tool has one request budget covering its queue wait, protocol handshake, input and resulting capture (60 seconds by default). A queued call that is cancelled or expires sends no input and does not cancel the active call. If input has already started, cancellation waits for that bounded operation and its cleanup before releasing the session lock, then requires a fresh screenshot. Stopping an owned SSH process has a separate bounded cleanup allowance.
 
 ## Optional Codex plugin distribution
 
@@ -92,7 +107,9 @@ See the [verification record](docs/verification.md) for actual checks and remain
 
 - **SSH failure:** run `ssh <alias>` in a normal terminal. The bridge uses `BatchMode=yes` and `StrictHostKeyChecking=yes`; it will not request a password or silently trust a new host key.
 - **No desktop/output:** log into the Pi's supported Wayland desktop. Raspberry Pi OS Lite alone has no desktop to capture. The bridge reports missing Wayland/WayVNC support instead of installing a desktop or changing login settings.
-- **Connection lost after input:** the action may already have happened. Take another screenshot and assess the result before retrying. The bridge never automatically replays input.
+- **Connection lost after input:** the action may already have happened. Take another screenshot and assess the result before retrying. Input remains blocked until that capture succeeds.
+- **Agent mismatch or missing prerequisites:** run `pi-desktop-bridge doctor --host <alias>`. After updating, deploy again and restart/reconnect the MCP server. No tools are silently installed on the Pi.
+- **Desktop busy:** ask the controlling client to call `desktop_disconnect` or stop its server. Health checks can run without acquiring the lease.
 - **Using it away from home:** the SSH alias must resolve to a reachable VPN/mesh address or another SSH route. A `.local` LAN hostname alone does not provide worldwide access. Tailscale login and ping do not prove that SSH is allowed from the computer running the client.
 - **Disable:** use `codex mcp remove pi_desktop` or disable the server in your client. Closing the MCP server stops its SSH agent and owned WayVNC process; no system service is installed.
 - **Uninstall the Pi agent:** after stopping clients, remove only `~/.local/share/pi-desktop-bridge` under the SSH user. This does not remove WayVNC, SSH or their existing configuration.
