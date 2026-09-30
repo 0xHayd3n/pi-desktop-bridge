@@ -9,7 +9,9 @@ import json
 import os
 from pathlib import Path
 import re
+import secrets
 import shlex
+import socket
 import subprocess
 import sys
 
@@ -147,10 +149,52 @@ def _idle_timeout(value: str) -> int:
     return seconds
 
 
+def _ui_port(value: str) -> int:
+    try:
+        port = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("port must be an integer from 0 to 65535") from exc
+    if not 0 <= port <= 65_535:
+        raise argparse.ArgumentTypeError("port must be an integer from 0 to 65535")
+    return port
+
+
+def run_ui(host: str, *, port: int = 0, capture_max_width: int = 960) -> None:
+    """Serve a capability-protected dashboard on IPv4 loopback only."""
+    import uvicorn
+
+    from .dashboard import create_dashboard
+
+    validate_host(host)
+    if type(port) is not int or not 0 <= port <= 65_535:
+        raise ValueError("port must be an integer from 0 to 65535")
+    if type(capture_max_width) is not int or not 1 <= capture_max_width <= 65_535:
+        raise ValueError("capture width must be an integer from 1 to 65535")
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        # Prevent another Windows process from sharing this bound address.
+        if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            listener.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        listener.bind(("127.0.0.1", port))
+        listener.listen(128)
+        listener.setblocking(False)
+        actual_port = listener.getsockname()[1]
+        origin = f"http://127.0.0.1:{actual_port}"
+        token = secrets.token_urlsafe(32)
+        app = create_dashboard(token=token, default_host=host, origin=origin,
+                               capture_max_width=capture_max_width)
+        config = uvicorn.Config(app, host="127.0.0.1", port=actual_port,
+                                access_log=False, log_level="warning", ws="websockets-sansio",
+                                ws_max_size=65_536, ws_max_queue=4,
+                                ws_per_message_deflate=False, ws_ping_interval=15,
+                                ws_ping_timeout=15)
+        print(f"Pi Desktop Bridge: {origin}/#token={token}", flush=True)
+        uvicorn.Server(config).run(sockets=[listener])
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Raspberry Pi desktop bridge over SSH")
     subparsers = parser.add_subparsers(dest="command", required=True)
-    for name in ("serve", "deploy", "doctor", "status", "screenshot"):
+    for name in ("serve", "ui", "deploy", "doctor", "status", "screenshot"):
         sub = subparsers.add_parser(name)
         sub.add_argument(
             "--host", default=os.environ.get("PI_DESKTOP_SSH_HOST", "pi-desktop"),
@@ -158,9 +202,15 @@ def _parser() -> argparse.ArgumentParser:
         )
         if name == "screenshot":
             sub.add_argument("--output", required=True, type=Path, help="PNG output path")
-        if name == "serve":
+        if name in {"serve", "ui"}:
             sub.add_argument("--capture-max-width", type=_capture_width,
-                             help="Maximum width of post-action images; explicit screenshots stay independent")
+                             default=960 if name == "ui" else None,
+                             help=("Maximum width of viewer images (default: 960)" if name == "ui" else
+                                   "Maximum width of post-action images; explicit screenshots stay independent"))
+        if name == "ui":
+            sub.add_argument("--port", type=_ui_port, default=0,
+                             help="Local UI port (default: choose a free loopback port)")
+        if name == "serve":
             sub.add_argument("--idle-timeout", type=_idle_timeout, default=300,
                              help="Release idle desktop sessions after this many seconds (default: 300; 0 disables)")
     return parser
@@ -182,6 +232,8 @@ def main(argv: list[str] | None = None) -> int:
                 create_server(args.host, transport=transport,
                               capture_max_width=args.capture_max_width,
                               idle_timeout=args.idle_timeout).run(transport="stdio")
+        elif args.command == "ui":
+            run_ui(args.host, port=args.port, capture_max_width=args.capture_max_width)
         else:
             with SSHTransport(args.host) as transport:
                 if args.command == "status":

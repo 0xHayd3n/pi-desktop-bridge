@@ -83,7 +83,7 @@ print(json.dumps({{'id': request['id'] + 1, 'result': {{'ok': True}}}}), flush=T
         for host in ("-oProxyCommand=bad", "user@pi", "pi;bad", "pi name", ""):
             with self.subTest(host=host), self.assertRaises(ValueError):
                 validate_host(host)
-        self.assertEqual(validate_host("raspberrypi-codex"), "raspberrypi-codex")
+        self.assertEqual(validate_host("pi-desktop"), "pi-desktop")
 
     @unittest.skipUnless(os.name == "nt", "Windows OpenSSH environment behavior")
     def test_filtered_mcp_environment_retains_windows_ssh_config_path(self) -> None:

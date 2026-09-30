@@ -4,13 +4,15 @@
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue)](pyproject.toml)
 [![MIT License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
-Give **Codex and other MCP-enabled assistants** eyes and hands on a Raspberry Pi's Wayland desktop. Capture real screenshots, move and click the mouse, drag, scroll, type Unicode text, and use keyboard shortcuts over an existing SSH connection.
+Give **Codex and other MCP-enabled assistants** eyes and hands on a Raspberry Pi's Wayland desktop. Open a local connection and desktop viewer in a browser tab, or use MCP tools to capture screenshots, move and click the mouse, drag, scroll, type Unicode text, and use keyboard shortcuts over SSH.
 
-The bridge runs on your computer and starts a small user-owned agent on the Pi. It uses the Pi's existing graphical session, with no extra hardware and no exposed VNC or web port. This controls the **Pi's own desktop**; controlling another computer needs a separate software connection or hardware KVM.
+The bridge runs on your computer and starts a small user-owned agent on the Pi. It uses the Pi's existing graphical session, with no extra hardware or Pi-side VNC/web network port. This controls the **Pi's own desktop**; controlling another computer needs a separate software connection or hardware KVM.
 
 ## Features
 
 - **Visual desktop control:** eleven MCP tools for screenshots, status, mouse, keyboard, and disconnect.
+- **Connection UI:** sign in with a Pi address, username, and password, or use an existing SSH alias; credentials stay in the local process rather than MCP tool arguments.
+- **Desktop stream:** noVNC displays continuous WayVNC updates over SSH, with direct mouse, drag, scroll, and keyboard input.
 - **Efficient images:** smaller overviews and native-resolution regions, with screenshot coordinates mapped back to the desktop.
 - **Observe after acting:** input tools return a fresh screenshot; visual waits sample an area until its pixels settle.
 - **Controlled sessions:** one client at a time, explicit disconnect, and configurable idle release after five minutes by default.
@@ -22,7 +24,7 @@ The bridge runs on your computer and starts a small user-owned agent on the Pi. 
 | Where | Required |
 | --- | --- |
 | Raspberry Pi | A running wlroots-compatible Wayland desktop, such as Raspberry Pi OS with labwc; `python3`, `wayvnc`, `grim`, and `wtype` |
-| SSH connection | A trusted host key and login without a password prompt; log in as the **same user who owns the graphical session** |
+| SSH connection | SSH enabled on the Pi; log in as the **same user who owns the graphical session**. The viewer supports a password or local keys; direct MCP setup requires an already trusted host key and login without a password prompt |
 | Client computer | Python 3.11+, OpenSSH, [uv](https://docs.astral.sh/uv/), and Git |
 | Assistant application | A local stdio MCP client that supports image content and tool calls, such as Codex |
 
@@ -34,7 +36,30 @@ sudo apt-get install --no-install-recommends wayvnc grim wtype
 
 Raspberry Pi OS Lite alone has no desktop to capture. A headless Pi still needs a running graphical session with an output configured by its compositor. This MCP integration is separate from Codex's native Computer Use tool.
 
-## Quick start
+## Open the Pi in a Codex tab
+
+Clone the repository on the computer running Codex, then launch the local viewer:
+
+```sh
+git clone https://github.com/0xHayd3n/pi-desktop-bridge.git
+cd pi-desktop-bridge
+uv sync --frozen
+uv run pi-desktop-bridge ui
+```
+
+Open the printed private launch link in Codex's built-in browser, or ask Codex to launch this command and open its link for you. No interactive terminal SSH login is needed for this flow. Enter the Pi's reachable address, graphical-session username, and password in the viewer, or choose **Use a saved SSH connection** and enter your existing SSH alias. To prefill that alias, launch with `ui --host <alias>`.
+
+For a previously unknown SSH host, check its fingerprint against a trusted source before selecting **Trust & connect**. Existing OpenSSH host keys are checked; a changed known key is rejected. New confirmations are held for this connection rather than saved to your SSH configuration. Passwords remain in memory while connected and are released on disconnect; they are not saved or passed through MCP tools.
+
+The viewer can deploy or update the packaged agent after login. The Pi still needs its supported desktop and desktop tools; the viewer does not install system packages or enable SSH. Its listener binds only to `127.0.0.1` and uses a private launch capability. Treat the launch link as private. Host and Origin checks, bounded requests, and a restrictive content security policy protect its local API.
+
+After login, the Pi desktop fills the viewer. Click inside it to focus, then click, drag, scroll, type, or use keyboard shortcuts directly. Plain ASCII paste, including tabs and newlines, uses an explicit browser clipboard gesture. Unsupported paste is rejected in full; the viewer does not synchronize clipboards in the background. The separate MCP text tool supports Unicode. Press **F6** to move focus to **Disconnect**.
+
+The viewer carries continuous RFB updates through an authenticated local HTTP response and SSH connection. Ordered input requests are acknowledged after their SSH writes. There is no screenshot polling or capture before clicking. A high capture ceiling avoids WayVNC's delay between changed frames; the tested 60 Hz Pi displayed about 49–56 canvas updates per second, with sampled key-to-screen times of 51–100 ms. Actual rate and input latency depend on the Pi, desktop activity, encoding, browser, and network route. An idle desktop sends changes when needed. This is a custom browser viewer, separate from Codex's native Computer Use backend. [Codex's browser supports local web applications](https://learn.chatgpt.com/docs/browser).
+
+Disconnect when finished. The viewer releases its SSH session after 30 seconds without its visible-tab heartbeat. Raw stream traffic does not keep a hidden or abandoned tab alive. It holds the Pi's exclusive desktop lease while active; another MCP client must wait for release. A failed stream requires explicit reconnection; input is never replayed automatically.
+
+## Direct MCP setup
 
 ### 1. Check SSH
 
@@ -111,7 +136,7 @@ See the [tool reference](docs/usage.md) for image coordinates, `view_id`, crop a
 
 ## Security and data handling
 
-- The bridge runs as the SSH user. It adds no network listener and uses an owned private WayVNC UNIX socket. OpenSSH retains your keys and authenticates the host.
+- The Pi agent runs as the SSH user and uses an owned private WayVNC UNIX socket. Its transport is SSH; the optional viewer's web listener is confined to local loopback. SSH credentials stay on the client computer.
 - Source hashes detect deployment drift; they do not attest that the remote machine is trustworthy. Use only a Pi and SSH account you trust.
 - Screenshots and typed content are sent to the MCP client and may be processed by its AI service. The server does not retain a screenshot history; explicit exports and opt-in verification scripts can save images locally.
 - Input is never automatically replayed. After uncertain delivery, inspect a fresh full-desktop screenshot before deciding whether to repeat an action.
@@ -123,7 +148,7 @@ See [architecture and trust boundaries](docs/architecture.md) for the protocol, 
 
 For use away from home, configure the SSH alias to a reachable VPN/mesh address or another working SSH route. A `.local` hostname provides LAN discovery, not worldwide access. VPN login or ping alone does not prove SSH reachability; test SSH from the network where you will run the client.
 
-The tested setup uses Raspberry Pi 5, Raspberry Pi OS / Debian 13, labwc, and a 1920 × 1080 output. Off-network SSH was not verified in that setup. Cross-window first-click delivery can depend on compositor focus; move and observe before clicking. A visual stability result means sampled pixels matched, not that an application is ready. See the [verification record](docs/verification.md) for evidence and remaining limits.
+The tested setup uses Raspberry Pi 5, Raspberry Pi OS / Debian 13, labwc, and a 1920 × 1080 output. Off-network SSH was not verified in that setup. Direct MCP cross-window first-click delivery can depend on compositor focus; move and observe before clicking. The streamed viewer sends pointer and key events directly, with no delivery guarantee on every compositor. A visual stability result means sampled pixels matched, not that an application is ready. See the [verification record](docs/verification.md) for measured streaming performance and remaining limits.
 
 ## Upgrade
 
@@ -152,6 +177,7 @@ Direct MCP configuration is the primary verified integration. The plugin files h
 
 ```sh
 uv run python -m unittest discover -s tests -v
+node scripts/check_ui_gestures.cjs
 uv build
 ```
 
@@ -164,6 +190,7 @@ uv run python scripts/live_smoke.py --host pi-desktop
 uv run python scripts/live_views.py --host pi-desktop
 uv run python scripts/live_stability.py --host pi-desktop
 uv run python scripts/live_lifecycle.py --host pi-desktop
+uv run python scripts/live_dashboard.py --host pi-desktop
 ```
 
 These are **opt-in input tests**. They open a disposable Tk window, operate it, then remove their fixture. They require `tkinter` and an Xwayland display at `:0` on the Pi. Images and reports go into ignored `_local/`. Run them when nobody else is using the desktop. See the [verification record](docs/verification.md) for checks actually completed.

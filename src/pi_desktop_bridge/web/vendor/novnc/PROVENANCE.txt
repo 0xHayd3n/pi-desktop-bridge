@@ -1,0 +1,4 @@
+noVNC 1.7.0, unmodified core and bundled pako from @novnc/novnc.
+Source: https://registry.npmjs.org/@novnc/novnc/-/novnc-1.7.0.tgz
+SHA-512 (base64): ucEJOx4T2avIRCleodk7YobZj5O2Ga2AeLfQ69A/yjG9HHba2+PDgwSkN3FttrmG+70ZGx21sElNFouK13RzyA==
+Licenses: LICENSE.txt, docs/LICENSE.*, vendor/pako/LICENSE.

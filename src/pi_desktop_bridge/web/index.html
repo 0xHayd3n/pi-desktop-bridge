@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#171629">
+  <title>Pi Desktop Bridge</title>
+  <link rel="stylesheet" href="/style.css">
+  <script type="module" src="/app.js"></script>
+</head>
+<body>
+  <main class="app-shell">
+    <section id="login-view" class="login-view" aria-labelledby="connection-heading">
+      <div class="login-card">
+        <div class="brand-icon" aria-hidden="true">▦</div>
+        <h1 id="connection-heading">Connect to your Pi</h1>
+        <p class="intro">Your desktop, right here.</p>
+        <div id="viewer-error" class="notice" role="alert" hidden></div>
+        <form id="connection-form" novalidate>
+          <input id="connection-mode" name="mode" type="hidden" value="password">
+          <div class="field"><label id="host-label" for="host">Pi address</label><input id="host" name="host" type="text" autocomplete="off" spellcheck="false" required placeholder="pi-desktop"></div>
+          <div id="credentials-fields">
+            <div class="field"><label for="username">Username</label><input id="username" name="username" type="text" autocomplete="username" spellcheck="false" required placeholder="pi"></div>
+            <div class="field"><label for="password">Password <span class="optional">optional with an SSH key</span></label><input id="password" name="password" type="password" autocomplete="off" placeholder="Enter your password"></div>
+          </div>
+          <details class="advanced"><summary>Connection options</summary>
+            <div id="port-field" class="field field-small"><label for="port">SSH port</label><input id="port" name="port" type="number" inputmode="numeric" min="1" max="65535" value="22" required></div>
+            <label class="check-row"><input id="deploy" name="deploy" type="checkbox" checked><span>Install or update desktop helper</span></label>
+          </details>
+          <div id="connection-error" class="form-error" role="alert" hidden></div>
+          <button id="connect-button" class="button primary full" type="submit">Connect</button>
+        </form>
+        <button id="mode-toggle" class="text-button" type="button">Use a saved SSH connection</button>
+      </div>
+    </section>
+
+    <section id="viewer-view" class="viewer-view" aria-label="Pi desktop" hidden>
+      <div id="screen-stage" class="screen-stage" aria-label="Live Pi desktop" tabindex="0"></div>
+      <div id="screen-placeholder" class="screen-placeholder" role="status"><div class="loading-mark" aria-hidden="true">▦</div><span id="screen-message">Connecting to desktop…</span></div>
+      <header class="viewer-toolbar">
+        <div class="viewer-identity"><span id="status-dot" class="status-dot" aria-hidden="true"></span><strong id="connected-host">Pi desktop</strong><span id="connection-status" class="connection-status" role="status">Connecting…</span></div>
+        <button id="disconnect-button" class="button toolbar-button" type="button" disabled>Disconnect</button>
+      </header>
+      <div id="viewer-error-connected" class="viewer-error" role="alert" hidden></div>
+    </section>
+  </main>
+
+  <dialog id="host-key-dialog" aria-labelledby="host-key-heading" aria-describedby="host-key-description"><div class="dialog-body"><span class="eyebrow">SSH identity</span><h2 id="host-key-heading">Trust this Pi?</h2><p id="host-key-description">Check this fingerprint against a trusted source before connecting.</p><dl><dt>Host</dt><dd id="host-key-host"></dd><dt>Algorithm</dt><dd id="host-key-algorithm"></dd><dt>Fingerprint</dt><dd id="host-key-fingerprint" class="fingerprint"></dd></dl><div class="dialog-actions"><button id="host-key-cancel" class="button subtle" type="button">Cancel</button><button id="host-key-trust" class="button primary" type="button">Trust &amp; connect</button></div></div></dialog>
+</body>
+</html>

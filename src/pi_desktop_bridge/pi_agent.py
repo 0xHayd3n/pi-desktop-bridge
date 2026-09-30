@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import re
 import secrets
+import select
 import shutil
 import signal
 import socket
@@ -37,11 +38,18 @@ MAX_PIXELS = 16_777_216
 MAX_TEXT_BYTES = 1_048_576
 IO_TIMEOUT = 10.0
 MAX_REQUEST_BYTES = 65_536
+STREAM_CHUNK_BYTES = 65_536
+# WayVNC 0.9.1's ext-image capture schedules from completion and subtracts
+# 4 ms from this interval. A low ceiling can miss every other 60 Hz refresh.
+# Request changed frames promptly; actual cadence follows the compositor,
+# encoding and client backpressure. This is a capture ceiling, not a promise.
+STREAM_MAX_FPS = 1000
+STREAM_RECORD_BYTES = 4096
 MAX_PNG_BYTES = MAX_PIXELS * 4 + MAX_TEXT_BYTES
 MAX_PPM_HEADER = 256
 MAX_PPM_BYTES = MAX_PIXELS * 3 + MAX_PPM_HEADER
 PROTOCOL_VERSION = 4
-AGENT_VERSION = "0.5.0"
+AGENT_VERSION = "0.6.0"
 # Identify the source that this process loaded, even if deployment replaces it.
 AGENT_SHA256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
 
@@ -434,7 +442,7 @@ class OwnedWayVNC:
         self.output_geometry = None
         self.capture_process = None
 
-    def ensure(self):
+    def ensure(self, *, max_fps=None, prime_capture=True):
         if self.client is not None:
             if self.process.poll() is None:
                 return self.client
@@ -455,9 +463,13 @@ class OwnedWayVNC:
             # Explicitly ignore the user's configuration: it may enable TCP,
             # authentication, or a shared control socket. umask applies to child
             # sockets without changing this process's global file permissions.
+            command = [executable, "-C", os.devnull, "-u", "-S", str(self.directory / "control.sock"),
+                       "-r", "-R"]
+            if max_fps is not None:
+                command.extend(["-f", str(max_fps)])
+            command.append(rfb_socket)
             self.process = subprocess.Popen(
-                [executable, "-C", os.devnull, "-u", "-S", str(self.directory / "control.sock"),
-                 "-r", "-R", rfb_socket],
+                command,
                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=sys.stderr,
                 env=environment, close_fds=True, start_new_session=True, umask=0o077,
             )
@@ -483,7 +495,8 @@ class OwnedWayVNC:
                 # Its input devices exist at this point, but exposing the first
                 # cached RFB framebuffer can precede real compositor capture.
                 # Require a compositor capture before accepting the first input.
-                self.screenshot_png()
+                if prime_capture:
+                    self.screenshot_png()
                 return self.client
             raise AgentError("Owned WayVNC did not become ready within 10 seconds")
         except BaseException:
@@ -1185,6 +1198,177 @@ def serve(desktop, incoming, outgoing):
                 break
     finally:
         desktop.close()
+
+
+def _stream_json(outgoing_fd, value, deadline):
+    data = json.dumps(value, ensure_ascii=True, separators=(",", ":")).encode("ascii") + b"\n"
+    if len(data) > STREAM_RECORD_BYTES:
+        raise AgentError("Stream startup record exceeds the byte limit")
+    while data:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise AgentError("Stream startup write timed out", code="timeout")
+        _, writable, _ = select.select([], [outgoing_fd], [], remaining)
+        if not writable:
+            continue
+        try:
+            written = os.write(outgoing_fd, data)
+        except BlockingIOError:
+            continue
+        if not written:
+            raise AgentError("Stream startup output closed")
+        data = data[written:]
+
+
+def _stream_read_start(incoming_fd, deadline):
+    # Read exactly the acknowledgement: the next byte may already be RFB.
+    expected, received = b"START\n", b""
+    while len(received) < len(expected):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise AgentError("Stream startup acknowledgement timed out", code="timeout")
+        readable, _, _ = select.select([incoming_fd], [], [], remaining)
+        if not readable:
+            continue
+        try:
+            part = os.read(incoming_fd, len(expected) - len(received))
+        except BlockingIOError:
+            continue
+        received += part
+        if not part or not expected.startswith(received):
+            raise AgentError("Stream startup requires START followed by a newline", code="invalid_request")
+
+
+def _relay_stream(connection, incoming_fd, outgoing_fd, process):
+    """Relay with one bounded buffer per direction and no background workers.
+
+    A full buffer stops reading its producer until its consumer accepts it.
+    The SSH pipes and the private socket therefore apply backpressure end to
+    end. A stalled consumer or an exited owned process ends the viewer.
+    """
+    to_wayvnc = b""
+    to_viewer = b""
+    wayvnc_deadline = viewer_deadline = None
+    while True:
+        if process.poll() is not None:
+            raise AgentError("Owned WayVNC exited during streaming")
+        now = time.monotonic()
+        deadlines = [value for value in (wayvnc_deadline, viewer_deadline) if value is not None]
+        if deadlines and min(deadlines) <= now:
+            raise AgentError("Stream consumer timed out", code="timeout")
+        # Periodically notice a dead child even when both peers are idle.
+        timeout = min([0.25] + [value - now for value in deadlines])
+        readers = ([] if to_wayvnc else [incoming_fd]) + ([] if to_viewer else [connection])
+        writers = ([connection] if to_wayvnc else []) + ([outgoing_fd] if to_viewer else [])
+        readable, writable, _ = select.select(readers, writers, [], timeout)
+        if connection in writable:
+            try:
+                sent = connection.send(to_wayvnc)
+            except BlockingIOError:
+                sent = None
+            if sent == 0:
+                return
+            if sent:
+                to_wayvnc = to_wayvnc[sent:]
+                wayvnc_deadline = time.monotonic() + IO_TIMEOUT if to_wayvnc else None
+        if outgoing_fd in writable:
+            try:
+                sent = os.write(outgoing_fd, to_viewer)
+            except BlockingIOError:
+                sent = None
+            if sent == 0:
+                return
+            if sent:
+                to_viewer = to_viewer[sent:]
+                viewer_deadline = time.monotonic() + IO_TIMEOUT if to_viewer else None
+        if incoming_fd in readable:
+            try:
+                to_wayvnc = os.read(incoming_fd, STREAM_CHUNK_BYTES)
+            except BlockingIOError:
+                continue
+            if not to_wayvnc:
+                return
+            wayvnc_deadline = time.monotonic() + IO_TIMEOUT
+        if connection in readable:
+            try:
+                to_viewer = connection.recv(STREAM_CHUNK_BYTES)
+            except BlockingIOError:
+                continue
+            if not to_viewer:
+                return
+            viewer_deadline = time.monotonic() + IO_TIMEOUT
+
+
+def stream_main():
+    """Fixed SSH bootstrap entry: provenance, START, readiness, then raw RFB.
+
+    This is deliberately separate from the JSON-RPC agent. The controller
+    verifies the exact loaded source before acknowledging permission to acquire
+    the desktop lease. No stream target or command comes from the browser.
+    """
+    session = OwnedWayVNC()
+    connection = None
+    binary_phase = False
+    blocking_modes = []
+    previous_handlers = []
+    incoming_fd = sys.stdin.buffer.fileno()
+    outgoing_fd = sys.stdout.buffer.fileno()
+
+    def stop(signum, _frame):
+        raise SystemExit(128 + signum)
+
+    try:
+        for name in ("SIGINT", "SIGTERM", "SIGHUP"):
+            if hasattr(signal, name):
+                signum = getattr(signal, name)
+                previous_handlers.append((signum, signal.signal(signum, stop)))
+        for fd in (incoming_fd, outgoing_fd):
+            blocking_modes.append((fd, os.get_blocking(fd)))
+            os.set_blocking(fd, False)
+        _stream_json(outgoing_fd, {
+            "mode": "rfb_stream", "protocol_version": PROTOCOL_VERSION,
+            "agent_version": AGENT_VERSION, "agent_sha256": AGENT_SHA256,
+        }, time.monotonic() + IO_TIMEOUT)
+        _stream_read_start(incoming_fd, time.monotonic() + IO_TIMEOUT)
+        probe = session.ensure(max_fps=STREAM_MAX_FPS, prime_capture=False)
+        # The probe validates geometry and output power without grim. Keep it
+        # owned until teardown, but give the viewer a fresh, untouched handshake.
+        _dimensions(probe.width, probe.height)
+        connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        connection.settimeout(IO_TIMEOUT)
+        connection.connect(str(session.directory / "rfb.sock"))
+        connection.setblocking(False)
+        # If this record is only partly written, append no second JSON record.
+        binary_phase = True
+        _stream_json(outgoing_fd, {"ready": True, "width": probe.width, "height": probe.height,
+                                   "max_fps": STREAM_MAX_FPS}, time.monotonic() + IO_TIMEOUT)
+        _relay_stream(connection, incoming_fd, outgoing_fd, session.process)
+    except Exception as exc:
+        if not binary_phase:
+            error = exc if isinstance(exc, AgentError) else AgentError("Desktop stream startup failed")
+            try:
+                _stream_json(outgoing_fd, {"error": error.as_dict()}, time.monotonic() + IO_TIMEOUT)
+            except (OSError, AgentError):
+                pass
+        else:
+            print("pi-desktop-agent stream ended: " + type(exc).__name__, file=sys.stderr)
+    finally:
+        try:
+            if connection is not None:
+                connection.close()
+        finally:
+            try:
+                # Destroying the two owned clients and WayVNC also destroys its
+                # virtual input devices, releasing keys/buttons on viewer EOF.
+                session.close()
+            finally:
+                for fd, blocking in reversed(blocking_modes):
+                    try:
+                        os.set_blocking(fd, blocking)
+                    except OSError:
+                        pass
+                for signum, handler in reversed(previous_handlers):
+                    signal.signal(signum, handler)
 
 
 def main():

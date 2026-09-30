@@ -1,5 +1,6 @@
 """Exercise RFB wire data and owned-session cleanup without a Pi desktop."""
 import base64
+from contextlib import ExitStack
 import hashlib
 import importlib.util
 import io
@@ -12,6 +13,8 @@ import struct
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 from types import SimpleNamespace
 import unittest
 from unittest import mock
@@ -511,7 +514,7 @@ class ProtocolV4Tests(unittest.TestCase):
              mock.patch.object(agent.subprocess, "Popen") as spawn:
             result = self.desktop.dispatch("hello", {})
         self.assertEqual(result["protocol_version"], 4)
-        self.assertEqual(result["agent_version"], "0.5.0")
+        self.assertEqual(result["agent_version"], "0.6.0")
         self.assertRegex(result["agent_sha256"], r"^[0-9a-f]{64}$")
         self.assertEqual(set(result["capabilities"]), {"hello", "health", "status", "screenshot", "wait_for_stable", "move", "click", "drag", "scroll", "type_text", "key", "disconnect"})
         ensure.assert_not_called()
@@ -698,6 +701,35 @@ class ProtocolV4Tests(unittest.TestCase):
 
 
 class LifecycleTests(unittest.TestCase):
+    def test_stream_start_requests_prompt_capture_without_compositor_screenshot(self):
+        with tempfile.TemporaryDirectory() as runtime:
+            wire = FragmentedSocket(handshake())
+            wire.connect = mock.Mock()
+            process = mock.Mock()
+            process.poll.return_value = None
+            with mock.patch.object(agent, "_wayland_environment", return_value=({"WAYLAND_DISPLAY": "wayland-0"}, runtime)), \
+                 mock.patch.object(agent, "DesktopLease") as lease, \
+                 mock.patch.object(agent.OwnedWayVNC, "_select_output_name", return_value="HDMI-A-1") as select_output, \
+                 mock.patch.object(agent.OwnedWayVNC, "screenshot_png") as capture, \
+                 mock.patch.object(agent.socket, "AF_UNIX", 1, create=True), \
+                 mock.patch.object(agent.shutil, "which", return_value="wayvnc"), \
+                 mock.patch.object(agent.subprocess, "Popen", return_value=process) as spawn, \
+                 mock.patch.object(agent.socket, "socket", return_value=wire):
+                session = agent.OwnedWayVNC()
+                try:
+                    client = session.ensure(max_fps=agent.STREAM_MAX_FPS, prime_capture=False)
+                    self.assertEqual((client.width, client.height), (2, 1))
+                    select_output.assert_called_once()
+                    capture.assert_not_called()
+                    argv = spawn.call_args.args[0]
+                    self.assertEqual(argv[argv.index("-f") + 1], "1000")
+                    self.assertEqual(argv[-1], str(session.directory / "rfb.sock"))
+                finally:
+                    session.close()
+                self.assertTrue(wire.closed)
+                process.terminate.assert_called_once()
+                lease.return_value.close.assert_called_once()
+
     def test_contended_lease_prevents_starting_wayvnc(self):
         with mock.patch.object(agent, "_wayland_environment", return_value=({}, "/run/user/1000")), \
              mock.patch.object(agent.shutil, "which", return_value="wayvnc"), \
@@ -1571,6 +1603,264 @@ class LeaseTests(unittest.TestCase):
         with self.assertRaisesRegex(agent.AgentError, "already controlled"):
             agent.DesktopLease("/run/user/1000")
         agent.os.close.assert_called_once_with(42)
+
+
+class StreamEntryTests(unittest.TestCase):
+    def run_stream(self, incoming=b"START\n", ensure_error=None, relay_error=None, connect_error=None,
+                   relay_signal=False, fail_ready_write=False):
+        source, output = io.BytesIO(incoming), io.BytesIO()
+        session, connection = mock.Mock(), mock.Mock()
+        session.directory = Path("/private/owned")
+        session.ensure.return_value = SimpleNamespace(width=1920, height=1080)
+        connection.connect.side_effect = connect_error
+        reads = []
+        handlers = {}
+        raised = None
+        ready_write_started = False
+        def ensure(**kwargs):
+            self.assertEqual(source.tell(), 6)
+            self.assertEqual(len(output.getvalue().splitlines()), 1)
+            if ensure_error:
+                raise ensure_error
+            return SimpleNamespace(width=1920, height=1080)
+        session.ensure.side_effect = ensure
+        def read(fd, count):
+            self.assertEqual(fd, 10)
+            reads.append(count)
+            return source.read(min(count, 2))
+        def write(fd, value):
+            nonlocal ready_write_started
+            self.assertEqual(fd, 11)
+            if fail_ready_write and output.getvalue().count(b"\n") == 1:
+                if ready_write_started:
+                    raise BrokenPipeError("viewer closed during readiness")
+                ready_write_started = True
+            # Exercise partial writes of both JSON records.
+            return output.write(value[:17])
+        def register(signum, handler):
+            handlers[signum] = handler
+            return agent.signal.SIG_DFL
+        def relay(*args):
+            if relay_signal:
+                handlers[agent.signal.SIGTERM](agent.signal.SIGTERM, None)
+            if relay_error:
+                raise relay_error
+        with ExitStack() as stack:
+            stack.enter_context(mock.patch.object(agent.sys, "stdin", SimpleNamespace(buffer=SimpleNamespace(fileno=lambda: 10))))
+            stack.enter_context(mock.patch.object(agent.sys, "stdout", SimpleNamespace(buffer=SimpleNamespace(fileno=lambda: 11))))
+            stack.enter_context(mock.patch.object(agent.sys, "stderr", io.StringIO()))
+            stack.enter_context(mock.patch.object(agent.os, "get_blocking", return_value=True, create=True))
+            blocking = stack.enter_context(mock.patch.object(agent.os, "set_blocking", create=True))
+            stack.enter_context(mock.patch.object(agent.os, "read", side_effect=read))
+            stack.enter_context(mock.patch.object(agent.os, "write", side_effect=write))
+            stack.enter_context(mock.patch.object(agent.select, "select", side_effect=lambda r, w, x, timeout: (r, w, [])))
+            signals = stack.enter_context(mock.patch.object(agent.signal, "signal", side_effect=register))
+            stack.enter_context(mock.patch.object(agent, "OwnedWayVNC", return_value=session))
+            stack.enter_context(mock.patch.object(agent.socket, "AF_UNIX", 1, create=True))
+            factory = stack.enter_context(mock.patch.object(agent.socket, "socket", return_value=connection))
+            relay_mock = stack.enter_context(mock.patch.object(agent, "_relay_stream", side_effect=relay))
+            try:
+                agent.stream_main()
+            except SystemExit as exc:
+                raised = exc
+        return SimpleNamespace(source=source, output=output.getvalue(), session=session, connection=connection,
+                               relay=relay_mock, factory=factory, blocking=blocking, signals=signals, reads=reads,
+                               raised=raised)
+
+    def test_provenance_precedes_lease_and_exact_start_preserves_pipelined_rfb(self):
+        result = self.run_stream(b"START\nRFB 003.008\n")
+        hello, ready = map(json.loads, result.output.splitlines())
+        self.assertEqual(hello, {"mode": "rfb_stream", "protocol_version": agent.PROTOCOL_VERSION,
+                               "agent_version": agent.AGENT_VERSION, "agent_sha256": agent.AGENT_SHA256})
+        self.assertEqual(ready, {"ready": True, "width": 1920, "height": 1080, "max_fps": 1000})
+        self.assertTrue(all(len(line) < 4096 for line in result.output.splitlines()))
+        self.assertEqual(result.source.read(), b"RFB 003.008\n")
+        self.assertLessEqual(max(result.reads), 6)
+        result.session.ensure.assert_called_once_with(max_fps=1000, prime_capture=False)
+        result.connection.connect.assert_called_once_with(str(Path("/private/owned/rfb.sock")))
+        result.relay.assert_called_once_with(result.connection, 10, 11, result.session.process)
+        result.connection.close.assert_called_once()
+        result.session.close.assert_called_once()
+        self.assertEqual(result.blocking.call_args_list, [mock.call(10, False), mock.call(11, False),
+                                                         mock.call(11, True), mock.call(10, True)])
+        registered = result.signals.call_args_list
+        self.assertEqual(sum(call.args[1] == agent.signal.SIG_DFL for call in registered), len(registered) // 2)
+
+    def test_invalid_or_missing_start_never_acquires_lease(self):
+        for start in (b"", b"STAR", b"START\r\n", b"WRONG\n"):
+            with self.subTest(start=start):
+                result = self.run_stream(start)
+                result.session.ensure.assert_not_called()
+                result.factory.assert_not_called()
+                result.relay.assert_not_called()
+                error = json.loads(result.output.splitlines()[-1])["error"]
+                self.assertEqual(error["code"], "invalid_request")
+                result.session.close.assert_called_once()
+
+    def test_busy_and_connection_failure_return_error_before_binary_phase(self):
+        for options, code in (({"ensure_error": agent.AgentError("already controlled", code="busy")}, "busy"),
+                              ({"connect_error": OSError("private path must not leak")}, "operation_failed")):
+            with self.subTest(code=code):
+                result = self.run_stream(**options)
+                lines = result.output.splitlines()
+                self.assertEqual(len(lines), 2)
+                error = json.loads(lines[-1])["error"]
+                self.assertEqual(error["code"], code)
+                self.assertNotIn("private path", error["message"])
+                result.relay.assert_not_called()
+                result.session.close.assert_called_once()
+
+    def test_relay_error_never_appends_json_to_rfb(self):
+        result = self.run_stream(relay_error=agent.AgentError("stalled relay", code="timeout"))
+        lines = result.output.splitlines()
+        self.assertEqual(len(lines), 2)
+        self.assertTrue(json.loads(lines[-1])["ready"])
+        result.connection.close.assert_called_once()
+        result.session.close.assert_called_once()
+
+    def test_signal_during_relay_closes_socket_and_owned_session(self):
+        result = self.run_stream(relay_signal=True)
+        self.assertIsInstance(result.raised, SystemExit)
+        self.assertEqual(result.raised.code, 128 + agent.signal.SIGTERM)
+        result.connection.close.assert_called_once()
+        result.session.close.assert_called_once()
+        self.assertEqual(len(result.output.splitlines()), 2)
+
+    def test_partial_ready_write_never_appends_error_or_enters_relay(self):
+        result = self.run_stream(fail_ready_write=True)
+        self.assertEqual(result.output.count(b"\n"), 1)
+        self.assertTrue(result.output.split(b"\n", 1)[1].startswith(b'{"ready":true'))
+        result.relay.assert_not_called()
+        result.connection.close.assert_called_once()
+        result.session.close.assert_called_once()
+
+    def test_start_deadline_and_record_limit_are_bounded(self):
+        with mock.patch.object(agent.select, "select", return_value=([], [], [])), \
+             mock.patch.object(agent.time, "monotonic", side_effect=[0.0, 10.0]):
+            with self.assertRaisesRegex(agent.AgentError, "timed out"):
+                agent._stream_read_start(10, 5.0)
+        with mock.patch.object(agent.os, "write") as write:
+            with self.assertRaises(agent.AgentError):
+                agent._stream_json(11, {"message": "x" * 4096}, 10.0)
+            write.assert_not_called()
+
+    def test_stream_is_not_a_json_rpc_method(self):
+        self.assertNotIn("stream", agent.PARAMETERS)
+        self.assertNotIn("stream_main", agent.PARAMETERS)
+
+
+@unittest.skipUnless(sys.platform.startswith("linux"), "requires Linux selectable stdio pipes")
+class LinuxStreamRelayTests(unittest.TestCase):
+    def setUp(self):
+        self.input_read, self.input_write = os.pipe()
+        self.output_read, self.output_write = os.pipe()
+        self.connection, self.peer = socket.socketpair()
+        self.connection.setblocking(False)
+        os.set_blocking(self.input_read, False)
+        os.set_blocking(self.output_write, False)
+        self.peer.settimeout(3)
+        self.process = SimpleNamespace(poll=lambda: None)
+        self.errors = []
+        self.worker = None
+
+    def tearDown(self):
+        # Closing the producer ends wakes every successful relay test.
+        self.peer.close()
+        if self.input_write is not None:
+            os.close(self.input_write)
+        if self.worker is not None:
+            self.worker.join(3)
+            self.assertFalse(self.worker.is_alive(), "relay did not stop")
+        self.connection.close()
+        for fd in (self.input_read, self.output_read, self.output_write):
+            os.close(fd)
+
+    def start_relay(self):
+        def run():
+            try:
+                agent._relay_stream(self.connection, self.input_read, self.output_write, self.process)
+            except Exception as exc:
+                self.errors.append(exc)
+        self.worker = threading.Thread(target=run, daemon=True)
+        self.worker.start()
+
+    def test_bidirectional_payload_exceeds_chunk_size_and_eof_stops(self):
+        self.start_relay()
+        payload = bytes(range(256)) * 1024
+        # Exchange in both directions repeatedly; pipes enforce real backpressure.
+        for offset in range(0, len(payload), 4096):
+            part = payload[offset:offset + 4096]
+            self.assertEqual(os.write(self.input_write, part), len(part))
+            received = bytearray()
+            while len(received) < len(part):
+                piece = self.peer.recv(len(part) - len(received))
+                self.assertTrue(piece, "relay closed before forwarding input")
+                received.extend(piece)
+            self.assertEqual(received, part)
+            self.peer.sendall(part[::-1])
+            received.clear()
+            while len(received) < len(part):
+                readable, _, _ = agent.select.select([self.output_read], [], [], 3)
+                self.assertTrue(readable, "relay did not forward server output")
+                piece = os.read(self.output_read, len(part) - len(received))
+                self.assertTrue(piece, "relay closed before forwarding server output")
+                received.extend(piece)
+            self.assertEqual(received, part[::-1])
+        os.close(self.input_write)
+        self.input_write = None
+        self.worker.join(3)
+        self.assertFalse(self.worker.is_alive())
+        self.assertEqual(self.errors, [])
+
+    def test_blocked_output_times_out_with_bounded_buffer(self):
+        self.peer.setblocking(False)
+        with mock.patch.object(agent, "IO_TIMEOUT", 0.1):
+            self.start_relay()
+            sent = 0
+            deadline = time.monotonic() + 2
+            while self.worker.is_alive() and time.monotonic() < deadline:
+                try:
+                    sent += self.peer.send(b"x" * 65536)
+                except BlockingIOError:
+                    time.sleep(0.01)
+            self.worker.join(1)
+        self.assertFalse(self.worker.is_alive())
+        self.assertGreater(sent, 65536)
+        self.assertEqual(len(self.errors), 1)
+        self.assertIsInstance(self.errors[0], agent.AgentError)
+        self.assertEqual(self.errors[0].code, "timeout")
+
+    def test_owned_process_exit_stops_idle_relay(self):
+        self.process = SimpleNamespace(poll=lambda: 1)
+        self.start_relay()
+        self.worker.join(1)
+        self.assertFalse(self.worker.is_alive())
+        self.assertEqual(len(self.errors), 1)
+        self.assertIsInstance(self.errors[0], agent.AgentError)
+
+    def test_blocked_wayvnc_times_out_without_reading_unbounded_input(self):
+        self.connection.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4096)
+        os.set_blocking(self.input_write, False)
+        with mock.patch.object(agent, "IO_TIMEOUT", 0.1):
+            self.start_relay()
+            deadline = time.monotonic() + 2
+            while self.worker.is_alive() and time.monotonic() < deadline:
+                try:
+                    os.write(self.input_write, b"x" * 65536)
+                except BlockingIOError:
+                    time.sleep(0.01)
+            self.worker.join(1)
+        self.assertFalse(self.worker.is_alive())
+        self.assertEqual(len(self.errors), 1)
+        self.assertIsInstance(self.errors[0], agent.AgentError)
+        self.assertEqual(self.errors[0].code, "timeout")
+
+    def test_wayvnc_eof_stops_idle_relay(self):
+        self.start_relay()
+        self.peer.shutdown(socket.SHUT_WR)
+        self.worker.join(1)
+        self.assertFalse(self.worker.is_alive())
+        self.assertEqual(self.errors, [])
 
 
 @unittest.skipUnless(sys.platform.startswith("linux"), "requires real Linux resource limits")

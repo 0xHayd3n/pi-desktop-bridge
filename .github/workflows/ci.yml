@@ -20,3 +20,4 @@ jobs:
           python-version: ${{ matrix.python }}
       - run: uv sync --frozen
       - run: uv run python -m unittest discover -s tests -v
+      - run: node scripts/check_ui_gestures.cjs

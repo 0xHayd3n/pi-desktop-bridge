@@ -60,6 +60,8 @@ def main():
     visual_patch = canvas.create_rectangle(450, 60, 510, 120, fill="#333333", outline="")
     command_path = state_path.with_name("command.json")
     visual_job = None
+    visual_interval = 75
+    unique_frames = False
 
     def visual_tick():
         nonlocal visual_job
@@ -69,18 +71,27 @@ def main():
             visual.update(mode="settled", color="#00ff00")
             visual_job = None
         else:
-            visual["color"] = "#ff0000" if visual["ticks"] % 2 else "#0000ff"
-            visual_job = root.after(75, visual_tick)
+            if unique_frames:
+                tick = visual["ticks"]
+                visual["color"] = "#{:02x}{:02x}{:02x}".format((tick * 7) % 256, (tick * 13) % 256, (tick * 23) % 256)
+            else:
+                visual["color"] = "#ff0000" if visual["ticks"] % 2 else "#0000ff"
+            visual_job = root.after(visual_interval, visual_tick)
         canvas.itemconfigure(visual_patch, fill=visual["color"])
         save()
 
     def read_command():
-        nonlocal visual_job
+        nonlocal visual_job, visual_interval, unique_frames
         if command_path.exists():
             command = json.loads(command_path.read_text(encoding="utf-8"))
             command_path.unlink()
             if command.get("mode") not in {"settle", "animate", "idle"} or not isinstance(command.get("id"), str):
                 raise ValueError("Invalid fixture command")
+            interval = command.get("interval_ms", 75)
+            if type(interval) is not int or not 8 <= interval <= 1000:
+                raise ValueError("Invalid fixture animation interval")
+            visual_interval = interval
+            unique_frames = command.get("unique_frames", False) is True
             if visual_job is not None:
                 root.after_cancel(visual_job)
                 visual_job = None
@@ -88,9 +99,24 @@ def main():
                                "command_id": command["id"]}
             canvas.itemconfigure(visual_patch, fill="#333333")
             if command["mode"] != "idle":
-                visual_job = root.after(75, visual_tick)
+                visual_job = root.after(visual_interval, visual_tick)
             save()
         root.after(25, read_command)
+
+    def latency_key(event):
+        nonlocal visual_job
+        if visual_job is not None:
+            root.after_cancel(visual_job)
+            visual_job = None
+        count = state.get("latency_keys", 0) + 1
+        state["latency_keys"] = count
+        color = "#00ff00" if count % 2 else "#ff00ff"
+        state["visual"].update(mode="idle", color=color)
+        canvas.itemconfigure(visual_patch, fill=color)
+        save()
+        return "break"
+
+    root.bind("<F9>", latency_key)
 
     def drag_start(event):
         state["drag"] = [[event.x, event.y]]

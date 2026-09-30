@@ -4,6 +4,7 @@ import hashlib
 import io
 import json
 from pathlib import Path
+import types
 import unittest
 from unittest import mock
 
@@ -121,6 +122,53 @@ class ServeTests(unittest.TestCase):
                     cli.main(["serve", "--idle-timeout", value])
                 self.assertEqual(raised.exception.code, 2)
                 transport.assert_not_called()
+
+
+class DashboardLaunchTests(unittest.TestCase):
+    def test_ui_defaults_and_overrides_reach_launcher_without_opening_ssh(self):
+        for options, port, width in (([], 0, 960), (["--port", "41233", "--capture-max-width", "640"], 41233, 640)):
+            with self.subTest(options=options), mock.patch.object(cli, "run_ui") as launch, \
+                    mock.patch.object(cli, "SSHTransport") as transport:
+                self.assertEqual(cli.main(["ui", "--host", "pi-target", *options]), 0)
+                launch.assert_called_once_with("pi-target", port=port, capture_max_width=width)
+                transport.assert_not_called()
+
+    def test_invalid_ui_port_is_rejected_before_launch(self):
+        for value in ("-1", "65536", "true", "1.0", "not-a-port"):
+            with self.subTest(value=value), mock.patch.object(cli, "run_ui") as launch, \
+                    contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as raised:
+                    cli.main(["ui", "--port", value])
+                self.assertEqual(raised.exception.code, 2)
+                launch.assert_not_called()
+
+    def test_target_host_never_becomes_the_listen_address_or_token_query(self):
+        import uvicorn
+
+        module = types.ModuleType("pi_desktop_bridge.dashboard")
+        module.create_dashboard = mock.MagicMock()
+        listener = mock.MagicMock()
+        listener.getsockname.return_value = ("127.0.0.1", 41233)
+        socket_context = mock.MagicMock()
+        socket_context.__enter__.return_value = listener
+        with mock.patch.dict("sys.modules", {"pi_desktop_bridge.dashboard": module}), \
+                mock.patch.object(cli.socket, "socket", return_value=socket_context), \
+                mock.patch.object(cli.secrets, "token_urlsafe", return_value="test-capability"), \
+                mock.patch.object(uvicorn, "Config") as config, \
+                mock.patch.object(uvicorn, "Server") as server, \
+                contextlib.redirect_stdout(io.StringIO()) as output:
+            cli.run_ui("remote-pi.example", port=0)
+        listener.bind.assert_called_once_with(("127.0.0.1", 0))
+        self.assertFalse(config.call_args.kwargs["access_log"])
+        self.assertEqual(config.call_args.kwargs["host"], "127.0.0.1")
+        module.create_dashboard.assert_called_once_with(
+            token="test-capability", default_host="remote-pi.example",
+            origin="http://127.0.0.1:41233", capture_max_width=960,
+        )
+        server.return_value.run.assert_called_once_with(sockets=[listener])
+        self.assertIn("http://127.0.0.1:41233/#token=test-capability", output.getvalue())
+        self.assertNotIn("?token=", output.getvalue())
+        socket_context.__exit__.assert_called_once()
 
 
 if __name__ == "__main__":

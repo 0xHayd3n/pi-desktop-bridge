@@ -1,5 +1,37 @@
 # Verification record
 
+Version 0.6.0 verified on 30 September 2026 on the same Raspberry Pi 5 / Debian 13 / labwc setup described below. Protocol remains 4; the packaged and deployed agent SHA-256 is `f952f1022e4e4d61f72c579e8ffed828b74fc5a547ff603ae3ff2ea990a3dd88`.
+
+| v0.6 check | Result |
+| --- | --- |
+| Full unit suites, Windows Python 3.14 and 3.11 | 303 tests each; 293 passed, ten Linux-only tests skipped |
+| Agent suite on Linux | All 128 passed on the actual Pi against the final source in 0.956 seconds, including real file locks, sockets, relay backpressure and owned process cleanup |
+| Dashboard access and request boundaries | Twenty-six tests cover Bearer/Host/Origin checks, bounded JSON, serialized operations, heartbeat release, cancellation, stale sessions and geometry, uncertain input, and both stages of bounded click preparation |
+| GUI SSH transport | Fifteen tests on both Python versions use a disposable real Paramiko SSH server: unknown/changed host keys, password isolation, fixed deployment/checksum, response deadlines, EOF ambiguity, cleanup and input sent once |
+| Exec acknowledgment deadlines | A server withholding its SSH exec acknowledgment was independently reproduced; the repaired startup and deployment returned in 0.153/0.166 seconds for 0.15-second budgets, with no surviving exec worker |
+| Live localhost dashboard API | All eight checks passed: unauthorized/foreign-origin rejection, saved-alias login and deployment, valid 960 × 540 PNG from the 1920 × 1080 desktop, click, Unicode and hotkey replacement, scrolling, exact drag endpoints, disconnect and stale-session rejection |
+| Live direct GUI transport | Paramiko authenticated with existing local keys, deployed the fixed agent, verified its source and captured a valid PNG from the actual Pi |
+| Continuous desktop stream | Source-checked agent opens a private WayVNC socket and relays raw RFB; no grim screenshot polling or capture before clicking. Native WebSocket did not open in the tested Codex browser, while authenticated HTTP streamed ten separate probe chunks in about 0.97 seconds; the viewer uses HTTP streaming |
+| Stream transport checks | Twenty-two tests cover strict metadata, partial writes, bounded queues, real SSH-window backpressure, stalled writes/rekey/cleanup and real owned-process termination; five alias/process checks also passed on WSL |
+| HTTP stream checks | Sixteen tests cover generation-bound tickets, stale identities, bounded bodies/queues, delivery acknowledgments, cancelled input, startup/disconnect races, output stalls and joined cleanup; twelve dashboard stream tests cover exclusivity and lifecycle |
+| Codex browser controls | Minimal login opens the full-window stream. Ordinary key events produced exact text; ASCII paste, Control+a, click, scroll and drag reached the owned fixture. Unsupported Unicode paste was rejected before any text was sent. F6 focused Disconnect, and one click returned to login |
+| Browser gesture checks | Node checks cover raw ordered input, queue limits, lifecycle races, held-input release, clipboard invalidation, unsupported paste and actual SetEncodings wire bytes; only Fence is omitted, while ContinuousUpdates remains |
+| Configured MCP launcher | Exact existing executable/arguments initialized all eleven tools from an unrelated working directory; native, overview and waited captures passed |
+| Package and isolated consumer | Source distribution and wheel byte-match all current source/web assets; an installed wheel from an unrelated working directory loads the UI routes, serves all 67 web files with matching bytes/MIME types, and passes dependency checks |
+| Publication privacy | Gitleaks 8.30.1 found no secrets in the candidate files or full Git history; private captures, reports, credentials and local connection details remain outside the release |
+
+The password/first-trust flow was verified against the disposable local SSH server. Actual Pi login used its already trusted local SSH credentials. No new password was requested in chat or written to configuration, and host-key stores were not changed. Live tests used owned disposable test windows; their screenshots and reports remain under ignored `_local/`. The viewer is separate from Codex's native Computer Use backend. Off-network SSH remains unverified. An intermittent LAN `.local` lookup failure was bypassed only in an ignored diagnostic process with the same strict known-host identity; this does not establish worldwide reachability.
+
+The former PNG viewer ran at about 1.3 fps. The continuous stream with a 60 fps capture cap and Fence enabled displayed 129 changed frames over 5.079 seconds (25.4 updates/s). Omitting Fence displayed 899 painted frames over 29.967 seconds (30.0 updates/s), using a counter without canvas pixel readback. The fixture's actual pixels changed 185 times in 3.000 seconds (61.7 Hz). A 120 fps capture-cap experiment still displayed about 30 updates/s. Requesting captures promptly with a 1000 fps ceiling yielded 4549 completed nonempty noVNC canvas paints over 80.959 seconds (56.2 updates/s). A fresh session on the final deployed source yielded 2530 paints over 51.763 seconds (48.9 updates/s). This counts rendered canvas updates, rather than physical monitor presentation. These are measurements of this Pi, screen activity and LAN route; a configured maximum is not a guarantee of 60 displayed fps.
+
+The high-ceiling small-patch animation used about 3.0% of one Pi CPU core in WayVNC and 0.6% in the stream agent over five seconds. With animation idle, WayVNC used about 0.2% and the agent accumulated no jiffy at the 0.2% measurement resolution. This checks idle spinning on this setup; it does not characterize full-screen video load.
+
+Five key-to-known-pixel samples were 350.2, 78.8, 75.5, 80.5 and 90.6 ms; the first was a cold sample. A later fresh-session sample was 103 ms. The fixture confirms received input; timing instrumentation identifies its green/magenta patch after rendering. No input is automatically replayed. Streaming events have different delivery semantics from the separate MCP snapshot tools; cross-compositor focus remains a practical limit.
+
+The final deployed source returned key-to-known-patch samples of 99.6, 97.4, 51.0, 55.9 and 67.7 ms (median 67.7 ms). That probe reads pixels only while a latency sample is pending; the displayed-rate counter performs no pixel readback. Final keyboard input and F6 focus escape were also exercised on that source.
+
+## Retained v0.5 and earlier evidence
+
 Version 0.5.0 verified on 30 September 2026 against a Raspberry Pi 5 running Raspberry Pi OS / Debian 13 with labwc 0.9.2, WayVNC 0.9.1, grim 1.4 and wtype 0.4. The active output was 1920 × 1080. Protocol remains 4; the final agent source SHA-256 was `5081807f3abaf3d428ba01f2894c2674d7e5822944eb0fe158f3f3e3d737731e`.
 
 | Check | Result |
